@@ -1,3 +1,0 @@
-﻿event_id,audio_id,source_audio_path,predicted_start_s,predicted_end_s,corrected_start_s,corrected_end_s,l1_label,l2_label,fault_type,note,reviewed_at,source_model_version,clip_path
-syn_mixed_ev001,syn_mixed,/Users/shuoqinlin/Desktop/wind_audio/data/synthetic/audio/syn_mixed.wav,7.0,7.1,,,,not_trained,,,,syn_supervised,clips/syn_mixed_ev001.wav
-syn_mixed_ev002,syn_mixed,/Users/shuoqinlin/Desktop/wind_audio/data/synthetic/audio/syn_mixed.wav,9.0,10.5,,,,not_trained,,,,syn_supervised,clips/syn_mixed_ev002.wav

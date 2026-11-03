@@ -67,12 +67,28 @@ class ModelTests(unittest.TestCase):
             self.assertEqual(high, [])
             self.assertAlmostEqual(loaded.threshold, 5.0)
 
-    @unittest.skipIf(importlib.util.find_spec("xgboost") is not None, "xgboost 已安装，不测回退")
-    def test_missing_xgboost_is_recorded_not_silent(self):
-        sel = select_backend("xgboost", allow_fallback=True, seed=0)
-        self.assertTrue(sel.fallback)
-        self.assertIn(sel.used, {"sklearn", "numpy"})
-        self.assertIn("xgboost", sel.reason)
+    def test_run_report_and_versioned_event_id(self):
+        from wind_audio.cli import _run_one
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            recs, anns, manifest, _ = _tiny_dataset(root)
+            det = BaselineDetector.train(recs, anns, ["n1", "n2"], manifest, CFG, version="v1")
+            args = dict(threshold=0.001, threshold_source="cli",
+                        postprocess={"min_duration": 0.1, "merge_gap": 0.3, "low_ratio": 0.5},
+                        postprocess_source="cli", fmax_plot=3000, clip_context=0.2,
+                        records=recs, anns=anns, manifest_path=manifest)
+            path = root / "audio/a1.wav"
+            _run_one(path, det, CFG, root / "v1", **args)
+            det.version = "v2"
+            _run_one(path, det, CFG, root / "v2", **args)
+            import json
+            before = json.loads((root / "v1/events.json").read_text())
+            after = json.loads((root / "v2/events.json").read_text())
+            self.assertTrue(before["events"])
+            self.assertNotEqual(before["events"][0]["event_id"], after["events"][0]["event_id"])
+            self.assertTrue((root / "v1/report.html").exists())
+            with self.assertRaisesRegex(ValueError, "审核记录"):
+                _run_one(path, det, CFG, root / "v1", **args)
 
     def test_supervised_save_load_and_config_mismatch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -88,7 +104,7 @@ class ModelTests(unittest.TestCase):
                 version="test_sup", seed=0, algo="numpy",
                 metadata={"file_ids": capped["file_ids"].tolist()},
             )
-            self.assertIn(sel.used, {"sklearn", "numpy"})
+            self.assertEqual(sel.used, "numpy")
             x, sr = load_wav(td / "audio" / "n1.wav", target_sr=CFG.sr)
             bundle = extract_features(x, sr, CFG, "n1")
             before = det.score(bundle)

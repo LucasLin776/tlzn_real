@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,7 @@ REVIEW_FIELDS = [
     "event_id", "audio_id", "source_audio_path", "predicted_start_s", "predicted_end_s",
     "corrected_start_s", "corrected_end_s", "l1_label", "l2_label", "fault_type",
     "note", "reviewed_at", "source_model_version", "clip_path",
+    "positive_types", "negative_types", "types_complete", "review_revision",
 ]
 
 
@@ -43,6 +45,11 @@ class ReviewRecord:
     reviewed_at: str = ""
     source_model_version: str = ""
     clip_path: str = ""
+
+    positive_types: str = ""
+    negative_types: str = ""
+    types_complete: bool = False
+    review_revision: int = 1
 
     def to_row(self) -> dict:
         row = asdict(self)
@@ -78,13 +85,13 @@ def read_reviews(path: str | Path) -> list[ReviewRecord]:
 def _num(value, default=None):
     if value in (None, ""):
         return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+    return float(value)
 
 
 def _row_to_review(row: dict) -> ReviewRecord:
+    complete = str(row.get("types_complete") or "").strip().lower()
+    if complete not in {"", "0", "1", "false", "true"}:
+        raise ValueError("types_complete 只能为 true/false 或 1/0")
     return ReviewRecord(
         event_id=(row.get("event_id") or "").strip(),
         audio_id=(row.get("audio_id") or "").strip(),
@@ -100,6 +107,10 @@ def _row_to_review(row: dict) -> ReviewRecord:
         reviewed_at=(row.get("reviewed_at") or "").strip(),
         source_model_version=(row.get("source_model_version") or "").strip(),
         clip_path=(row.get("clip_path") or "").strip(),
+        positive_types=(row.get("positive_types") or "").strip(),
+        negative_types=(row.get("negative_types") or "").strip(),
+        types_complete=complete in {"1", "true"},
+        review_revision=int(row.get("review_revision") or 1),
     )
 
 
@@ -120,6 +131,8 @@ def validate_reviews(reviews: list[ReviewRecord]) -> list[str]:
     if len(ids) != len(set(ids)):
         errors.append("review 中存在重复 event_id")
     for r in reviews:
+        if r.review_revision < 1:
+            errors.append(f"{r.event_id}: review_revision 必须为正整数")
         if not r.event_id:
             errors.append("存在空 event_id")
         if not r.audio_id:
@@ -127,13 +140,13 @@ def validate_reviews(reviews: list[ReviewRecord]) -> list[str]:
         if r.predicted_end_s <= r.predicted_start_s:
             errors.append(f"{r.event_id}: predicted 起止顺序错误")
         a, b = r.effective_interval()
-        if b <= a:
+        if not (math.isfinite(a) and math.isfinite(b) and 0 <= a < b):
             errors.append(f"{r.event_id}: corrected 起止顺序错误")
         if r.l1_label and r.l1_label not in L1_LABELS:
             errors.append(f"{r.event_id}: 非法 l1_label={r.l1_label}")
         if r.l2_label and r.l2_label not in L2_LABELS:
             errors.append(f"{r.event_id}: 非法 l2_label={r.l2_label}")
-        if r.l2_label == "fault" and not r.fault_type:
+        if r.l2_label == "fault" and not (r.fault_type or r.positive_types):
             errors.append(f"{r.event_id}: l2_label=fault 但 fault_type 为空，请填写具体类型")
     return errors
 
@@ -176,6 +189,12 @@ def import_reviews(path: str | Path, out_csv: str | Path, out_json: str | Path |
     existing = read_reviews(out_csv) if out_csv.exists() else []
     merged = {r.event_id: r for r in existing}
     for r in incoming:
+        before = merged.get(r.event_id)
+        if before:
+            fields = ("l1_label", "positive_types", "negative_types", "types_complete",
+                      "corrected_start_s", "corrected_end_s")
+            changed = any(getattr(before, k) != getattr(r, k) for k in fields)
+            r.review_revision = max(r.review_revision, before.review_revision + int(changed))
         if not r.reviewed_at:
             r.reviewed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         merged[r.event_id] = r

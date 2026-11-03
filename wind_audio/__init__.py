@@ -1,7 +1,7 @@
-"""风机音频异常检测 —— L1 baseline + supervised prototype."""
+"""Wind audio: L1 candidates + PANNs L2 + human-reviewed incremental learning."""
 from __future__ import annotations
 
 from .l1 import NormalModel
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 __all__ = ["NormalModel", "__version__"]

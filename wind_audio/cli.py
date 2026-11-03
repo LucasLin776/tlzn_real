@@ -1,9 +1,4 @@
-"""Command line entry points.
-
-New dataset-driven commands: check, migrate-labels, split, train, calibrate,
-evaluate, run, review-export, review-import.
-Legacy ``train --normal-dir`` / ``run --model`` / ``probe`` remain usable.
-"""
+"""L1 training, inference, review, and the shared command-line entry point."""
 from __future__ import annotations
 
 import argparse
@@ -46,7 +41,6 @@ from .detectors import (
 from .evaluate import evaluate_detector, write_eval_outputs
 from .events import extract_events
 from .features import FeatureConfig, build_matrix, extract_features, load_or_extract
-from .l1 import NormalModel
 from .render import score_png, spectrogram_png, waveform_png
 from .report import write_report
 from .review import (
@@ -230,55 +224,6 @@ def cmd_split(args) -> int:
 
 
 # -------------------------------------------------------------------- train
-def _legacy_train(args) -> int:
-    cfg = _cfg_from_args(args)
-    if args.n_mels is None:
-        cfg = FeatureConfig.from_dict({**cfg.to_dict(), "n_mels": 128})
-    files = sorted(Path(args.normal_dir).rglob("*.wav"))
-    demo = False
-    if not files:
-        if not args.demo_from:
-            print(
-                f"没有在 {args.normal_dir} 找到 .wav。\n"
-                "请放入正常样本，或先用 --demo-from <音频> 跑通链路（演示模型不可用于生产）。",
-                file=sys.stderr,
-            )
-            return 2
-        files = [Path(args.demo_from)]
-        demo = True
-
-    chunks = []
-    for path in files:
-        x, sr = load_wav(path, target_sr=cfg.sr)
-        mel, _, _ = _mel_for_legacy(x, sr, cfg)
-        chunks.append(mel)
-        print(f"  {path.name}: {mel.shape[0]} frames")
-    mel = np.concatenate(chunks, axis=0)
-    if demo:
-        frame_level = mel.mean(axis=1)
-        cut = float(np.quantile(frame_level, 0.80))
-        mask = frame_level <= cut
-        model = NormalModel(threshold_z=args.threshold, version=f"{args.version}_demo", config={**cfg.to_dict(), "demo": True})
-        model.fit(mel, mask=mask)
-    else:
-        model = NormalModel(threshold_z=args.threshold, version=args.version, config=cfg.to_dict())
-        model.fit(mel)
-    out = model.save(
-        args.out,
-        demo=demo,
-        extra={"train_files": [p.name for p in files], "train_frames": int(mel.shape[0])},
-    )
-    print(f"\n模型已保存: {out}")
-    print(f"  版本={model.version} 训练帧={mel.shape[0]} 阈值={model.threshold_z} demo={demo}")
-    return 0
-
-
-def _mel_for_legacy(x, sr, cfg: FeatureConfig):
-    from .audio import log_mel
-
-    return log_mel(x, sr, cfg.n_fft, cfg.hop, cfg.n_mels, cfg.fmin, cfg.fmax)
-
-
 def _train_new(args) -> int:
     records, anns, errors, _ = _load_dataset(args)
     _require_clean(errors)
@@ -313,8 +258,7 @@ def _train_new(args) -> int:
         }
         detector, selection = SupervisedDetector.train(
             capped["X"], capped["y"], data["feature_names"], cfg,
-            version=args.version, seed=args.seed, algo=args.algo,
-            allow_fallback=not args.no_fallback, metadata=meta,
+            version=args.version, seed=args.seed, metadata=meta,
         )
         print(f"分类后端：请求 {selection.requested}，实际 {selection.used}"
               + ("（回退）" if selection.fallback else ""))
@@ -353,9 +297,7 @@ def _train_new(args) -> int:
 
 
 def cmd_train(args) -> int:
-    if args.manifest:
-        return _train_new(args)
-    return _legacy_train(args)
+    return _train_new(args)
 
 
 # --------------------------------------------------------------- calibrate
@@ -487,11 +429,18 @@ def _run_one(
                 break
     bundle = extract_features(x, sr, cfg, audio_id)
     events = detector.predict_events(bundle, threshold=threshold, postprocess=postprocess)
+    from .l2.common import digest, file_hash
+    audio_hash = file_hash(path)
     for ev in events:
+        ev["event_id"] = audio_id + "_" + digest(
+            [audio_hash, ev["start_s"], ev["end_s"], detector.version,
+             cfg.to_dict(), threshold, postprocess])[:20]
         ev["review"] = (reviews_by_id or {}).get(ev["event_id"])
     regions = regions_from_mask(label_mask(record, anns, cfg.target_step)) if record else []
     gt = anomaly_events(record, anns) if record else []
 
+    if (out_dir / "review.csv").exists():
+        raise ValueError("输出目录已有审核记录，请使用新目录，避免覆盖人工标注")
     out_dir.mkdir(parents=True, exist_ok=True)
     audio_rel = _copy_audio(path, out_dir, audio_id)
     clips_dir = out_dir / "clips"
@@ -515,6 +464,7 @@ def _run_one(
             "id": audio_id,
             "file": path.name,
             "path": str(path.resolve()),
+            "sha256": audio_hash,
             "duration_s": round(duration, 6),
             "sr": sr,
             "analyzed_fmax_hz": cfg.fmax,
@@ -579,16 +529,9 @@ def cmd_run(args) -> int:
         print(f"没有 wav: {input_path}", file=sys.stderr)
         return 2
 
-    if args.model:
-        detector = load_detector(args.model)
-        _assert_model_cfg(detector, args)
-        cfg = detector.feature_config
-    elif args.demo:
-        detector = None
-        cfg = _cfg_from_args(args)
-    else:
-        print("需要 --model <目录> 或 --demo（演示拟合，不可用于生产）", file=sys.stderr)
-        return 2
+    detector = load_detector(args.model)
+    _assert_model_cfg(detector, args)
+    cfg = detector.feature_config
 
     records, anns = [], []
     if args.manifest:
@@ -600,7 +543,7 @@ def cmd_run(args) -> int:
 
     threshold = None if args.threshold is None else float(args.threshold)
     threshold_source = "cli" if threshold is not None else (
-        "demo" if detector is None else ("calibration" if detector.calibrated else "model")
+        "calibration" if detector.calibrated else "model"
     )
     pp_override = {
         "min_duration": args.min_dur,
@@ -611,26 +554,9 @@ def cmd_run(args) -> int:
     pp_source = "cli" if pp_override else "model"
 
     out_base = Path(args.out) if args.out else Path("runs")
-    stems = [p.stem for p in files]
     results = []
     for path in files:
-        if detector is None:
-            # explicit demo: fit on this file's quietest 80% of frames
-            x, sr = load_wav(path, target_sr=cfg.sr)
-            from .audio import log_mel
-
-            mel, _, _ = log_mel(x, sr, cfg.n_fft, cfg.hop, cfg.n_mels, cfg.fmin, cfg.fmax)
-            fit_mel = mel - np.median(mel, axis=0) if cfg.normalize == "per_file" else mel
-            level = fit_mel.mean(axis=1)
-            mask = level <= np.quantile(level, 0.80)
-            model = NormalModel(threshold_z=args.threshold or 5.0, version="l1_demo", config={**cfg.to_dict(), "demo": True})
-            model.fit(fit_mel, mask=mask)
-            det = BaselineDetector(
-                model, version="l1_demo", feature_config=cfg,
-                threshold=args.threshold or 5.0, postprocess={}, calibrated=False, demo=True,
-            )
-        else:
-            det = detector
+        det = detector
         thr = det.threshold if threshold is None else threshold
         pp = {**DEFAULT_POSTPROCESS, **det.postprocess, **pp_override}
         if len(files) == 1 and args.out:
@@ -726,7 +652,7 @@ def _add_data_args(p: argparse.ArgumentParser, required: bool = True) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="wind_audio", description="风机音频 L1 异常检测")
+    p = argparse.ArgumentParser(prog="wind_audio", description="风机音频两级检测与人工审核增量学习")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     q = sub.add_parser("probe")
@@ -765,8 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_split)
 
-    t = sub.add_parser("train", help="训练 L1（有 manifest 时走新流程）")
-    _add_data_args(t, required=False)
+    t = sub.add_parser("train", help="训练 L1 候选检测器")
+    _add_data_args(t)
     t.add_argument("--splits", default="data/splits.json")
     t.add_argument("--detector", choices=["baseline", "supervised"], default="baseline")
     t.add_argument("--out", default="models/l1_v2")
@@ -774,14 +700,10 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--threshold", type=float, default=5.0)
     t.add_argument("--target-recall", type=float, default=0.95)
     t.add_argument("--seed", type=int, default=42)
-    t.add_argument("--algo", choices=["auto", "xgboost", "sklearn", "numpy"], default="auto")
-    t.add_argument("--no-fallback", action="store_true")
     t.add_argument("--max-total-samples", type=int, default=50000)
     t.add_argument("--max-samples-per-file", type=int, default=5000)
     t.add_argument("--cache-dir", default="cache/features")
     t.add_argument("--no-calibrate", action="store_true")
-    t.add_argument("--normal-dir", default="data/normal")
-    t.add_argument("--demo-from", default=None)
     _add_feature_args(t)
     t.set_defaults(func=cmd_train)
 
@@ -808,8 +730,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     r = sub.add_parser("run", help="单条/批量推理并生成报告")
     r.add_argument("--input", required=True)
-    r.add_argument("--model", default=None)
-    r.add_argument("--demo", action="store_true")
+    r.add_argument("--model", required=True)
     r.add_argument("--out", default=None)
     r.add_argument("--manifest", default=None)
     r.add_argument("--annotations", default=None)
@@ -834,6 +755,8 @@ def build_parser() -> argparse.ArgumentParser:
     rim.add_argument("--json", default=None)
     rim.add_argument("--emit-annotations", default=None)
     rim.set_defaults(func=cmd_review_import)
+    from .l2.cli import register
+    register(sub)
     return p
 
 

@@ -30,23 +30,6 @@ class AnnotationInputTests(unittest.TestCase):
             self.assertEqual(read_annotations(path), [])
 
 
-class BackendPolicyTests(unittest.TestCase):
-    def test_auto_no_fallback_stops_at_first_unavailable_backend(self):
-        with patch("wind_audio.backends._make", side_effect=ImportError("unavailable")) as make:
-            with self.assertRaises(RuntimeError):
-                select_backend("auto", allow_fallback=False)
-        make.assert_called_once_with("xgboost", 42)
-
-    def test_auto_fallback_is_still_explicitly_recorded(self):
-        backend = object()
-        with patch("wind_audio.backends._make", side_effect=[ImportError("unavailable"), backend]):
-            selection = select_backend("auto", allow_fallback=True)
-        self.assertIs(selection.backend, backend)
-        self.assertEqual(selection.used, "sklearn")
-        self.assertTrue(selection.fallback)
-        self.assertIn("unavailable", selection.reason)
-
-
 class EventGapTests(unittest.TestCase):
     def test_gap_uses_interval_edges_including_exact_boundary(self):
         times = (np.arange(5) + 0.5) * 0.1

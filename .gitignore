@@ -52,4 +52,4 @@ Thumbs.db
 *.tmp
 *.swp
 
-# A gitignore does not untrack previously committed files. See docs/GITHUB.md.
+# Ignore rules do not untrack files already committed. Review git status before publishing.

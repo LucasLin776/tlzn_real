@@ -1,0 +1,7 @@
+{
+  "classes": [
+    {"id": "impact", "name": "冲击/敲击型异常"},
+    {"id": "friction", "name": "摩擦/刮擦型异常"},
+    {"id": "tonal", "name": "持续窄带异音"}
+  ]
+}

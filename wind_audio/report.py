@@ -180,11 +180,10 @@ def write_report(
             f'验证集实际召回 {_fmt((cal.get("validation") or {}).get("event_recall"), 3)}。</div>'
         )
     backend_note = ""
-    if backend and backend.get("used") not in (None, "", "xgboost"):
+    if backend and backend.get("used"):
         backend_note = (
-            f'<div class="warn"><b>后端不是 XGBoost</b>：实际使用 <code>{html.escape(str(backend.get("used")))}</code>'
-            f'（请求 {html.escape(str(backend.get("requested")))}）。'
-            "该替代算法已写入模型元数据，不能按 XGBoost 结果解读。</div>"
+            f'<div class="ok">分类器：<code>{html.escape(str(backend["used"]))}</code>；'
+            "分数不代表机械故障概率。</div>"
         )
 
     total_alarm = sum(ev["duration_s"] for ev in events)

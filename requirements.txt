@@ -1,3 +1,4 @@
-# Run from the repository root. Metadata lives in pyproject.toml.
-# Default: CPU sklearn backend. For XGBoost: pip install '.[xgboost]'.
-.[sklearn]
+# Runtime dependencies for the post_training environment.
+# Install manually: python -m pip install -r requirements.txt
+numpy>=1.24,<3
+torch>=2.6,<3

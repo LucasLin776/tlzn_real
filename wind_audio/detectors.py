@@ -2,8 +2,7 @@
 
 * ``BaselineDetector`` keeps the original median/MAD ``NormalModel`` and can
   load legacy ``models/l1_demo`` directories.
-* ``SupervisedDetector`` uses XGBoost when available, otherwise an explicitly
-  recorded sklearn / numpy fallback.
+* ``SupervisedDetector`` is the NumPy logistic-regression control.
 """
 from __future__ import annotations
 
@@ -19,8 +18,6 @@ from .audio import load_wav, log_mel
 from .backends import (
     BackendSelection,
     NumpyLogisticBackend,
-    SklearnBackend,
-    XGBBackend,
     backend_versions,
     select_backend,
 )
@@ -318,8 +315,8 @@ class SupervisedDetector(BaseDetector):
         *,
         version: str = "l1_supervised",
         seed: int = 42,
-        algo: str = "auto",
-        allow_fallback: bool = True,
+        algo: str = "numpy",
+        allow_fallback: bool = False,
         metadata: dict | None = None,
     ) -> tuple["SupervisedDetector", BackendSelection]:
         X = np.asarray(X, dtype=np.float32)
@@ -402,11 +399,7 @@ class SupervisedDetector(BaseDetector):
         d = Path(model_dir)
         meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
         used = meta.get("backend", {}).get("used", "")
-        if used == "xgboost":
-            backend = XGBBackend.load(d / "model")
-        elif used in {"sklearn", "sklearn_hist_gradient_boosting"}:
-            backend = SklearnBackend.load(d / "model")
-        elif used in {"numpy", "numpy_logistic"}:
+        if used in {"numpy", "numpy_logistic"}:
             backend = NumpyLogisticBackend.load(d / "model")
         else:
             raise ValueError(f"未知 backend: {used}")
