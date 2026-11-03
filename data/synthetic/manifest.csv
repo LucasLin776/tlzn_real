@@ -1,0 +1,13 @@
+﻿audio_id,path,source_id,device_id,recorded_at,duration_s,sample_rate,channels,fully_reviewed,notes
+syn_normal_a,audio/syn_normal_a.wav,S1,D1,,12.0,44100,1,true,normal background A
+syn_normal_gain,audio/syn_normal_gain.wav,S2,D1,,12.0,44100,1,true,"same background, fixed -8 dB gain"
+syn_switch,audio/syn_switch.wav,S3,D2,,12.0,44100,1,true,normal background switch at 5 s
+syn_short_impact,audio/syn_short_impact.wav,S4,D2,,12.0,44100,1,true,0.12 s impact
+syn_sustained,audio/syn_sustained.wav,S5,D3,,12.0,44100,1,true,3 s broadband anomaly
+syn_edge_start,audio/syn_edge_start.wav,S6,D3,,12.0,44100,1,true,anomaly at first sample
+syn_edge_end,audio/syn_edge_end.wav,S7,D3,,12.0,44100,1,true,anomaly at last sample
+syn_mixed,audio/syn_mixed.wav,S8,D2,,12.0,44100,1,true,switch + short + sustained
+syn_normal_b,audio/syn_normal_b.wav,S9,D4,,12.0,44100,1,true,normal background C
+syn_sustained_b,audio/syn_sustained_b.wav,S10,D4,,12.0,44100,1,true,5 s sustained anomaly
+syn_short_b,audio/syn_short_b.wav,S11,D4,,12.0,44100,1,true,0.3 s impact
+syn_mixed_b,audio/syn_mixed_b.wav,S12,D4,,12.0,44100,1,true,background switch + 2 s anomaly

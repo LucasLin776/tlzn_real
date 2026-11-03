@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>L1 异常检测报告 · A01_01_20261030_120227.wav</title>
+<style>
+  :root { --ink:#1c2430; --muted:#66707d; --line:#e3e7ec; --bg:#f6f8fa; --accent:#1f4e8c; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:28px; background:var(--bg); color:var(--ink);
+         font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif; }
+  .wrap { max-width:1180px; margin:0 auto; }
+  h1 { font-size:21px; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:18px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px;
+           padding:18px 20px; margin-bottom:16px; }
+  .warn { background:#fff4f2; border:1px solid #f2c3bb; color:#8a2c1e;
+           padding:10px 14px; border-radius:8px; margin-bottom:14px; }
+  .ok { background:#f1f8f3; border:1px solid #c4e3cc; color:#22653a;
+         padding:10px 14px; border-radius:8px; margin-bottom:14px; }
+  .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin:4px 0 2px; }
+  .kpi { background:var(--bg); border-radius:8px; padding:10px 12px; }
+  .kpi .v { font-size:20px; font-weight:600; color:var(--accent); }
+  .kpi .l { font-size:12px; color:var(--muted); }
+  img { width:100%; display:block; border-radius:6px; }
+  .cap { font-size:12px; color:var(--muted); margin:6px 0 14px; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th,td { padding:7px 8px; border-bottom:1px solid var(--line); text-align:right; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align:left; }
+  th { color:var(--muted); font-weight:500; background:#fafbfc; }
+  .note { color:var(--muted); font-size:12.5px; }
+  code { background:#eef1f4; padding:1px 5px; border-radius:4px; }
+  details { margin-top:8px; }
+</style></head><body><div class="wrap">
+  <h1>L1 异常检测报告</h1>
+  <div class="sub">A01_01_20261030_120227.wav · 时长 29.96s · 采样率 44100 Hz · 模型 l1_demo</div>
+  <div class="warn"><b>演示模式</b>：模型只用本文件的安静段拟合，阈值没有用正常样本校准。本报告仅用于验证链路，<b>不能作为故障判定依据</b>。</div>
+  <div class="card">
+    <div class="grid">
+      <div class="kpi"><div class="v">9</div><div class="l">报警事件</div></div>
+      <div class="kpi"><div class="v">11.67s</div><div class="l">报警总时长</div></div>
+      <div class="kpi"><div class="v">8.0σ</div><div class="l">当前阈值</div></div>
+      <div class="kpi"><div class="v">L2 未训练</div><div class="l">故障 / 工况变化判别</div></div>
+    </div>
+  </div>
+  <div class="card">
+    <img src="spectrogram.png" alt="spectrogram">
+    <div class="cap">时频图（线性频率 0–20 kHz）。绿框 = L1 报警事件。颜色越亮能量越强。</div>
+    <img src="score.png" alt="score curve">
+    <div class="cap">帧级异常分数（10 ms 一帧，已做 0.15 s 中值平滑）。红色虚线 = 阈值；浅红底 = 报警区间。</div>
+  </div>
+  <div class="card">
+    <table>
+      <thead><tr>
+        <th>#</th><th>起止 (s)</th><th>时长 (s)</th><th>峰值 z</th>
+        <th>质心 (Hz)</th><th>平坦度</th><th>4–10k 占比</th><th>&lt;200Hz 占比</th>
+        <th>峰值频率 (Hz)</th><th>起始斜率 (z/s)</th>
+      </tr></thead>
+      <tbody><tr><td>1</td><td>3.94 – 5.20</td><td>1.26</td><td>36.3</td><td>6440</td><td>0.135</td><td>72.6%</td><td>0.3%</td><td>6697</td><td>158</td></tr>
+<tr><td>2</td><td>9.08 – 9.65</td><td>0.57</td><td>29.7</td><td>3123</td><td>0.065</td><td>30.4%</td><td>11.8%</td><td>194</td><td>89</td></tr>
+<tr><td>3</td><td>10.29 – 11.48</td><td>1.19</td><td>33.9</td><td>3019</td><td>0.057</td><td>29.9%</td><td>4.8%</td><td>452</td><td>123</td></tr>
+<tr><td>4</td><td>11.91 – 12.71</td><td>0.80</td><td>35.6</td><td>4798</td><td>0.107</td><td>51.3%</td><td>3.0%</td><td>194</td><td>115</td></tr>
+<tr><td>5</td><td>16.21 – 17.79</td><td>1.58</td><td>36.9</td><td>6253</td><td>0.201</td><td>69.8%</td><td>0.2%</td><td>6761</td><td>174</td></tr>
+<tr><td>6</td><td>18.90 – 20.87</td><td>1.97</td><td>36.6</td><td>6697</td><td>0.241</td><td>70.5%</td><td>0.4%</td><td>6632</td><td>91</td></tr>
+<tr><td>7</td><td>22.32 – 24.96</td><td>2.64</td><td>36.7</td><td>6312</td><td>0.198</td><td>68.3%</td><td>0.4%</td><td>6761</td><td>83</td></tr>
+<tr><td>8</td><td>27.66 – 28.83</td><td>1.17</td><td>36.9</td><td>6815</td><td>0.244</td><td>68.3%</td><td>0.4%</td><td>6804</td><td>90</td></tr>
+<tr><td>9</td><td>29.47 – 29.96</td><td>0.49</td><td>35.5</td><td>6907</td><td>0.303</td><td>59.7%</td><td>4.2%</td><td>215</td><td>101</td></tr></tbody>
+    </table>
+    <p class="note">事件特征已写入 <code>events.csv</code> / <code>events.json</code>，这是后续 L2 的训练输入。
+    平坦度接近 0 → 窄带/谐波；接近 1 → 宽带噪声。起始斜率大 → 冲击型；小 → 缓变型。</p>
+  </div>
+  <div class="card">
+    <details><summary>模型与参数</summary>
+      <p class="note">版本 <code>l1_demo</code> · 阈值 8.00
+      · 正常训练文件 1 个 · demo=true</p>
+      <p class="note">L1 只学“正常长什么样”。L2 尚未训练，按设计在服务器上用人工复核数据迭代；
+      当前报告只把事件和特征交给人审。</p>
+    </details>
+  </div>
+</div></body></html>

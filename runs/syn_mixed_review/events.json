@@ -1,0 +1,172 @@
+{
+  "schema_version": "2.0",
+  "audio": {
+    "id": "syn_mixed",
+    "file": "syn_mixed.wav",
+    "path": "/Users/shuoqinlin/Desktop/wind_audio/data/synthetic/audio/syn_mixed.wav",
+    "duration_s": 12.0,
+    "sr": 44100,
+    "analyzed_fmax_hz": 16000.0
+  },
+  "model": {
+    "version": "syn_supervised",
+    "detector": "supervised",
+    "score_type": "probability_uncalibrated",
+    "threshold": 0.9995320439338684,
+    "threshold_source": "calibration",
+    "postprocess": {
+      "min_duration": 0.1,
+      "merge_gap": 0.3,
+      "low_ratio": 0.5
+    },
+    "postprocess_source": "model",
+    "calibrated": true,
+    "demo": false,
+    "backend": {
+      "requested": "sklearn",
+      "used": "sklearn",
+      "fallback": false,
+      "reason": "",
+      "versions": {
+        "numpy": "2.5.3",
+        "sklearn": "1.9.1",
+        "xgboost": null
+      }
+    }
+  },
+  "events": [
+    {
+      "score_type": "probability_uncalibrated",
+      "peak_score": 0.9995320439338684,
+      "mean_score": 0.9995320439338684,
+      "peak_time_s": 7.050000000000001,
+      "duration_s": 0.1,
+      "at_edge": false,
+      "centroid_hz": 15611.172652395917,
+      "flatness": 0.47775569558143616,
+      "peak_freq_hz": 18518.5546875,
+      "harmonicity_db": 8.317522048950195,
+      "share_0_200": 7.408919191220775e-05,
+      "share_200_1k": 0.00023112562485039234,
+      "share_1k_4k": 0.009770956821739674,
+      "share_4k_10k": 0.12102405726909637,
+      "share_10k_up": 0.8688998818397522,
+      "onset_slope_per_s": null,
+      "event_id": "syn_mixed_ev001",
+      "start_s": 7.0,
+      "end_s": 7.1,
+      "threshold": 0.9995320439338684,
+      "review": {
+        "event_id": "syn_mixed_ev001",
+        "audio_id": "syn_mixed",
+        "source_audio_path": "/Users/shuoqinlin/Desktop/wind_audio/data/synthetic/audio/syn_mixed.wav",
+        "predicted_start_s": 7.0,
+        "predicted_end_s": 7.1,
+        "corrected_start_s": 7.0,
+        "corrected_end_s": 7.2,
+        "l1_label": "anomaly",
+        "l2_label": "nonfault",
+        "fault_type": "",
+        "note": "异常但非故障",
+        "reviewed_at": "2026-11-03T04:37:48+00:00",
+        "source_model_version": "syn_supervised",
+        "clip_path": "clips/syn_mixed_ev001.wav"
+      },
+      "clip": {
+        "path": "clips/syn_mixed_ev001.wav",
+        "start_s": 4.0,
+        "end_s": 10.1,
+        "sr": 44100
+      }
+    },
+    {
+      "score_type": "probability_uncalibrated",
+      "peak_score": 0.9995320439338684,
+      "mean_score": 0.9995320439338684,
+      "peak_time_s": 9.05,
+      "duration_s": 1.5,
+      "at_edge": false,
+      "centroid_hz": 15506.883705299428,
+      "flatness": 0.5353695750236511,
+      "peak_freq_hz": 21102.5390625,
+      "harmonicity_db": 4.147880554199219,
+      "share_0_200": 9.679853246780112e-05,
+      "share_200_1k": 0.0002490401384420693,
+      "share_1k_4k": 0.009777047671377659,
+      "share_4k_10k": 0.1280858963727951,
+      "share_10k_up": 0.86179119348526,
+      "onset_slope_per_s": 2.0908768735539522e-16,
+      "event_id": "syn_mixed_ev002",
+      "start_s": 9.0,
+      "end_s": 10.5,
+      "threshold": 0.9995320439338684,
+      "review": {
+        "event_id": "syn_mixed_ev002",
+        "audio_id": "syn_mixed",
+        "source_audio_path": "/Users/shuoqinlin/Desktop/wind_audio/data/synthetic/audio/syn_mixed.wav",
+        "predicted_start_s": 9.0,
+        "predicted_end_s": 10.5,
+        "corrected_start_s": "",
+        "corrected_end_s": "",
+        "l1_label": "normal",
+        "l2_label": "nonfault",
+        "fault_type": "",
+        "note": "误报",
+        "reviewed_at": "2026-11-03T04:37:48+00:00",
+        "source_model_version": "syn_supervised",
+        "clip_path": "clips/syn_mixed_ev002.wav"
+      },
+      "clip": {
+        "path": "clips/syn_mixed_ev002.wav",
+        "start_s": 6.0,
+        "end_s": 12.0,
+        "sr": 44100
+      }
+    }
+  ],
+  "annotations": {
+    "regions": [
+      {
+        "start_s": 0.0,
+        "end_s": 7.0,
+        "label": "normal",
+        "reviewed": true
+      },
+      {
+        "start_s": 7.0,
+        "end_s": 7.1,
+        "label": "anomaly",
+        "reviewed": true
+      },
+      {
+        "start_s": 7.1,
+        "end_s": 9.0,
+        "label": "normal",
+        "reviewed": true
+      },
+      {
+        "start_s": 9.0,
+        "end_s": 10.5,
+        "label": "anomaly",
+        "reviewed": true
+      },
+      {
+        "start_s": 10.5,
+        "end_s": 12.0,
+        "label": "normal",
+        "reviewed": true
+      }
+    ],
+    "gt_events": [
+      {
+        "start_s": 7.0,
+        "end_s": 7.12
+      },
+      {
+        "start_s": 9.0,
+        "end_s": 10.5
+      }
+    ],
+    "source": "syn_mixed"
+  }
+}

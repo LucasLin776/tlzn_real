@@ -1,0 +1,2 @@
+﻿audio_id,path,source_id,device_id,recorded_at,duration_s,sample_rate,channels,fully_reviewed,notes
+A01_01_20261030_120227,anomaly/A01_01_20261030_120227.wav,A01_01_20261030_120227,,,30.002721088435376,44100,1,false,迁移自旧 labels.csv；未声明整段完整审核

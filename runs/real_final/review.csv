@@ -1,0 +1,10 @@
+﻿event_id,audio_id,source_audio_path,predicted_start_s,predicted_end_s,corrected_start_s,corrected_end_s,l1_label,l2_label,fault_type,note,reviewed_at,source_model_version,clip_path
+A01_01_20261030_120227_ev001,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,4.0,5.2,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev001.wav
+A01_01_20261030_120227_ev002,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,9.1,9.7,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev002.wav
+A01_01_20261030_120227_ev003,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,10.3,11.5,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev003.wav
+A01_01_20261030_120227_ev004,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,11.9,12.7,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev004.wav
+A01_01_20261030_120227_ev005,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,16.2,17.8,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev005.wav
+A01_01_20261030_120227_ev006,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,18.9,20.9,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev006.wav
+A01_01_20261030_120227_ev007,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,22.3,25.0,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev007.wav
+A01_01_20261030_120227_ev008,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,27.7,28.8,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev008.wav
+A01_01_20261030_120227_ev009,A01_01_20261030_120227,/Users/shuoqinlin/Desktop/wind_audio/data/anomaly/A01_01_20261030_120227.wav,29.5,30.0,,,,not_trained,,,,l1_demo,clips/A01_01_20261030_120227_ev009.wav
