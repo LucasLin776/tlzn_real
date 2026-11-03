@@ -30,6 +30,7 @@ class SupervisedIntegrationTests(unittest.TestCase):
                 "--splits", str(root / "splits.json"), "--detector", "supervised",
                 "--algo", "sklearn", "--out", str(model), "--version", "it_sup",
                 "--target-recall", "0.9",
+                "--cache-dir", str(Path(td) / "cache"),
             ])
             meta = json.loads((model / "meta.json").read_text(encoding="utf-8"))
             self.assertEqual(meta["detector"], "supervised")

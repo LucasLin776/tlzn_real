@@ -64,7 +64,8 @@ def extract_events(
 
     merged: list[list[int]] = []
     for a, b in intervals:
-        if merged and times[a] - times[merged[-1][1]] <= merge_gap + 1e-9:
+        # Compare interval edges, not centres: adjacent cells have zero gap.
+        if merged and times[a] - times[merged[-1][1]] - step_s <= merge_gap + 1e-9:
             merged[-1][1] = b
         else:
             merged.append([a, b])

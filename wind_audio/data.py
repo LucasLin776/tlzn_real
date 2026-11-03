@@ -148,7 +148,7 @@ def write_manifest(records: list[AudioRecord], path: str | Path) -> Path:
 def read_annotations(path: str | Path) -> list[Annotation]:
     path = Path(path)
     if not path.exists():
-        return []
+        raise FileNotFoundError(f"标注文件不存在: {path}；不能将缺失标注当成空标注")
     with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         anns = []

@@ -1,0 +1,5 @@
+file,start_s,end_s,label,group
+sample_a.wav,0,12,normal,recording_001
+sample_a.wav,12,14,anomaly,recording_001
+sample_a.wav,14,30,normal,recording_001
+sample_b.wav,0,30,normal,recording_002

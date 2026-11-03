@@ -210,7 +210,7 @@ def select_backend(requested: str = "auto", allow_fallback: bool = True, seed: i
             )
         except Exception as exc:
             reasons.append(f"{name}: {exc}")
-            if not allow_fallback and requested != "auto":
+            if not allow_fallback:
                 break
     raise RuntimeError(
         "没有可用的分类后端。\n" + "\n".join(reasons) +

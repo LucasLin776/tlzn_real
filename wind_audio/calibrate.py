@@ -15,6 +15,8 @@ from .features import extract_features
 
 
 def _candidate_thresholds(scores: np.ndarray, score_type: str) -> list[float]:
+    scores = np.asarray(scores).ravel()
+    scores = scores[np.isfinite(scores)]
     if len(scores) == 0:
         return []
     if score_type == "baseline_z":
@@ -27,10 +29,13 @@ def _candidate_thresholds(scores: np.ndarray, score_type: str) -> list[float]:
     # classifier with scores {0.0005, 0.9995} can pick a threshold just below
     # the low plateau, so normal frames never fall below the hysteresis exit.
     uniq = np.unique(scores)
+    # Bound the search independently of recording length. Preserve extrema and
+    # real score plateaus; sampling indices avoids inventing cluster values.
+    if len(uniq) > 64:
+        indices = np.linspace(0, len(uniq) - 1, 64).round().astype(int)
+        uniq = uniq[indices]
     if len(uniq) > 1:
         mids = (uniq[:-1] + uniq[1:]) / 2.0
-        if len(mids) > 300:
-            mids = np.quantile(mids, np.linspace(0.0, 1.0, 300))
         eps = np.maximum(np.abs(uniq) * 1e-3, 1e-9)
         vals = np.unique(np.concatenate([vals, mids, uniq + eps, np.nextafter(uniq, np.inf)]))
     return [float(v) for v in vals if np.isfinite(v) and v > 0]
@@ -49,6 +54,8 @@ def calibrate_detector(
     merge_gaps: tuple[float, ...] = (0.1, 0.3, 0.5),
     low_ratios: tuple[float, ...] = (0.5, 0.6, 0.7, 0.8, 0.9),
 ) -> dict:
+    if not np.isfinite(target_recall) or not 0 < target_recall <= 1:
+        raise ValueError("target_recall 必须在 (0, 1] 范围内")
     by_id = {r.audio_id: r for r in records}
     bundles = []
     for audio_id in audio_ids:
@@ -108,6 +115,9 @@ def calibrate_detector(
     pool = feasible if feasible else rows
     pool.sort(
         key=lambda r: (
+            # If the target is unreachable, maximise recall before minimising
+            # false alarms; otherwise a silent detector can beat every useful one.
+            -r["recall"] if not target_reached else 0.0,
             (r["fa_per_hour"] if r["fa_per_hour"] is not None else 1e18),
             -r["precision"],
             -r["recall"],

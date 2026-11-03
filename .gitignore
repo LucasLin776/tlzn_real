@@ -1,0 +1,55 @@
+# Python and packaging
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local recordings, annotations, models and generated outputs (keep on disk).
+/data/*
+!/data/README.md
+/models/
+/cache/
+/runs/
+/outputs/
+/reports/
+/backup/
+
+# Audio/model assets should be distributed separately after approval.
+*.[wW][aA][vV]
+*.flac
+*.mp3
+*.npz
+*.npy
+*.pkl
+*.joblib
+*.pt
+*.pth
+*.onnx
+
+# Secrets and machine-specific files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+*.tmp
+*.swp
+
+# A gitignore does not untrack previously committed files. See docs/GITHUB.md.

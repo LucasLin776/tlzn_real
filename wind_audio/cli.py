@@ -360,11 +360,14 @@ def cmd_train(args) -> int:
 
 # --------------------------------------------------------------- calibrate
 def cmd_calibrate(args) -> int:
+    if args.split != "val":
+        raise ValueError("只能使用 val 校准；test 必须保留为独立测试集")
     detector = load_detector(args.model)
     records, anns, errors, _ = _load_dataset(args)
     _require_clean(errors)
     split = load_splits(args.splits)
-    audio_ids = split.val if args.split == "val" else split.test
+    assert_no_leakage(split)
+    audio_ids = split.val
     calib = calibrate_detector(
         detector, records, anns, audio_ids, args.manifest,
         target_recall=args.target_recall,
@@ -388,13 +391,14 @@ def cmd_evaluate(args) -> int:
     _require_clean(errors)
     split = load_splits(args.splits)
     audio_ids = split.ids(args.split)
+    assert_no_leakage(split)
     pp = {}
     for key in ("min_duration", "merge_gap", "low_ratio"):
         value = getattr(args, key, None)
         if value is not None:
             pp[key] = value
-    if args.threshold is not None and args.split == "test":
-        print("警告：在 test 上显式覆盖阈值，结果不再是冻结模型的正式测试成绩。", file=sys.stderr)
+    if (args.threshold is not None or pp) and args.split == "test":
+        print("警告：在 test 上覆盖阈值/后处理，结果不再是冻结模型的正式测试成绩。", file=sys.stderr)
     result = evaluate_detector(
         detector, records, anns, audio_ids, args.manifest, detector.feature_config,
         threshold=args.threshold, postprocess=pp or None, iou_threshold=args.match_iou,
@@ -649,7 +653,7 @@ def cmd_run(args) -> int:
             continue
         results.append(result)
         print(f"{path.name}: {result['events']} 事件 -> {result['report']}")
-    return 0
+    return 0 if len(results) == len(files) else 1
 
 
 # ------------------------------------------------------------------- review
@@ -785,7 +789,7 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--model", required=True)
     _add_data_args(cal)
     cal.add_argument("--splits", default="data/splits.json")
-    cal.add_argument("--split", choices=["val", "test"], default="val")
+    cal.add_argument("--split", choices=["val"], default="val")
     cal.add_argument("--target-recall", type=float, default=0.95)
     cal.set_defaults(func=cmd_calibrate)
 
