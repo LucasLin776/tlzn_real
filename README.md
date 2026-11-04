@@ -1,6 +1,6 @@
 # Wind Audio：风机音频两级检测
 
-当前工程版本 **0.6.0**，L1 配置版本 **spectral_event_v2**。
+当前工程版本 **0.6.1**，L1 配置版本 **spectral_event_v2**。
 
 | 层 | 输入与作用 | 输出 | 是否训练 |
 |---|---|---|---|
@@ -21,20 +21,47 @@ L1 只用 NumPy；L2 的 CNN14 还需 PyTorch。依赖见 `requirements.txt`。
 从工程目录可直接运行 `python -m wind_audio`，无需安装本项目。
 WAV 支持 8/16/32 位整数 PCM；24 位及浮点 WAV 需先转换。多声道平均为单声道。
 
-## 用 B02 标注检验 L1
+## L1 的两个入口
+
+| 入口 | 数据输入 | 用途与输出 |
+|---|---|---|
+| `l1-detect` 检测版 | `--input` 原始 WAV 文件或目录 | 实际工作：输出事件窗口、切片、可试听报告；不接收标签 |
+| `l1-test` 测试版 | `--audio-dir` 音频目录 + `--labels` 标签文件或目录 | 测试与改进：调用同一 L1，接入检验器，输出准确率、召回率、误报和逐条对比 |
+
+两个入口共享算法及 `config/l1.json`。标签仅在测试版中参与结果比较，不进入检测算法。
+旧命令 `run`、`evaluate` 分别作为两者的别名保留；`run` 也不再接受标签输入。
+实际检测仍是离线 WAV 分析，不是实时流式服务。
+
+### 检测版：仅指定原始音频
 
 ```bash
-python -m wind_audio evaluate \
+python -m wind_audio l1-detect \
+  --input /Users/shuoqinlin/Desktop/B02/音频 \
+  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
+  --out /Users/shuoqinlin/Desktop/wind_audio/runs/l1_detect_B02
+```
+
+替换 `--input` 就能切换实际工作数据；也可以直接指定单条 `.wav` 的完整路径。
+目录输入生成 `index.html` 和逐文件报告；单文件输入直接生成 `report.html`。
+`review.csv` 是新生成的空审核模板，不是检测输入。
+
+### 测试版：指定音频和标签
+
+```bash
+python -m wind_audio l1-test \
   --audio-dir /Users/shuoqinlin/Desktop/B02/音频 \
   --labels /Users/shuoqinlin/Desktop/B02/标注 \
   --pairing sorted --assume-unlabeled-normal \
-  --config config/l1.json --out reports/l1_B02_new
+  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
+  --out /Users/shuoqinlin/Desktop/wind_audio/reports/l1_test_B02
 ```
 
 本数据集已确认：B02-001～100 对应音频按时间排序；所有音频完整审核；
 空标注和未标注部分为正常；全部标记均为 L1 目标事件，不区分名称。
 `--pairing sorted` 仅用于已确认顺序对应的数据；默认按同名配对。
 输出目录必须为空或不存在，避免覆盖既有标注和评估结果。
+调整 `--threshold` 等参数或编辑配置后，用新的输出目录对比结果；测试命令不会自动训练 L1。
+确定参数后，检测版使用相同配置即可。正式测试集不应反复用于调参。
 
 现有默认配置的 B02 结果在 [评估简报](reports/l1_B02/brief.md)：
 
@@ -55,11 +82,11 @@ python -m wind_audio evaluate \
 检验器也支持简易 CSV/JSON（`file,label` 或 `file,start_s,end_s,label`）和现有清单：
 
 ```bash
-python -m wind_audio evaluate \
+python -m wind_audio l1-test \
   --audio-dir /path/to/audio --labels /path/to/labels.csv \
   --config config/l1.json --out reports/l1_check
 
-python -m wind_audio evaluate \
+python -m wind_audio l1-test \
   --manifest /path/to/manifest.csv --annotations /path/to/annotations.csv \
   --config config/l1.json --out reports/l1_check_manifest
 ```
@@ -67,7 +94,7 @@ python -m wind_audio evaluate \
 ## L1 检测与审核
 
 ```bash
-python -m wind_audio run --input /path/to/audio \
+python -m wind_audio l1-detect --input /path/to/audio \
   --config config/l1.json --out runs/l1_latest
 ```
 
@@ -90,7 +117,7 @@ L1 默认 44.1 kHz、2048 点 FFT、64 Mel、20 ms 输出步长，比较前后�
 | `--relative-floor-db` | 15 dB | 相对整条录音强声参考的筛选范围 |
 | `--merge-gap` / `--padding` | 0.35 / 0.05 秒 | 窗口合并间隔 / 每侧边界补充 |
 
-完整参数见 `python -m wind_audio run --help` 和 `config/l1.json`。
+完整参数见 `python -m wind_audio l1-detect --help` 和 `config/l1.json`。
 分数不是概率；稳定异音、缓慢变化、短促弱事件和录音边缘可能漏检，工况切换可能误报。
 全文件离线分析使用未来上下文，不是流式服务；20 ms 网格不等于真实边界精度。
 

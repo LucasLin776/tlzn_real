@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wind-audio"
-version = "0.6.0"
+version = "0.6.1"
 description = "Training-free spectral windows and reviewed PANNs continual learning"
 readme = "README.md"
 requires-python = ">=3.10"

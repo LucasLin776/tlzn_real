@@ -7,6 +7,11 @@ L2 使用候选窗口和原音频，通过冻结的 PANNs CNN14 提取特征，�
 本检验器只调用 L1，标签只用于比较，不参与特征计算、背景估计或参数拟合。
 所有事件名称均作为 L1 二分类正例；类别名称只保留作追溯。
 
+检测入口是 `l1-detect --input 原始音频路径`，只接受音频与检测配置，不接受标签。
+测试入口是 `l1-test --audio-dir 音频目录 --labels 标签路径`，必须同时给出音频和标签。
+二者共享同一检测算法；`run/evaluate` 分别保留为旧命令别名。
+工作数据路径与运行示例见 [README 的两个入口](../README.md#l1-的两个入口)。
+
 ## 2. 已实现的步骤
 
 1. **读取与配对**：`markers.py` 读取每条音频对应的 Name/Start/Duration 标注。
@@ -18,7 +23,7 @@ L2 使用候选窗口和原音频，通过冻结的 PANNs CNN14 提取特征，�
    仅声明完整审核时，将未标注部分及空标注文件当正常；否则为 unknown。
 3. **运行 L1**：加载 `config/l1.json`，逐条读取原始音频，经 `extract_features`
    和 `SpectralChangeDetector.predict_events` 输出最终候选窗口。
-   与 `run` 命令使用同一检测实现，不使用标签辅助检测，不做重新训练。
+   与 `l1-detect` 命令使用同一检测实现，不使用标签辅助检测，不做重新训练。
 4. **比较文件**：出现任意候选窗口就预测整条音频“有事件”。
    与文件标签或精确区间推导的文件标签比较，记录 TP/TN/FP/FN。
 5. **比较时间与事件**：合并预测窗口的重叠时长，按连续区间计算 TP/TN/FP/FN 秒数，
@@ -33,14 +38,14 @@ L2 使用候选窗口和原音频，通过冻结的 PANNs CNN14 提取特征，�
 ```bash
 conda activate post_training
 cd /Users/shuoqinlin/Desktop/wind_audio
-python -m wind_audio evaluate \
+python -m wind_audio l1-test \
   --audio-dir /Users/shuoqinlin/Desktop/B02/音频 \
   --labels /Users/shuoqinlin/Desktop/B02/标注 \
   --pairing sorted \
   --assume-unlabeled-normal \
-  --config config/l1.json \
+  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
   --match-iou 0.1 \
-  --out reports/l1_B02_new
+  --out /Users/shuoqinlin/Desktop/wind_audio/reports/l1_test_B02
 ```
 
 首次结果已保存于 `reports/l1_B02`；重跑使用新的输出目录。
@@ -76,7 +81,7 @@ b.wav,0,30,normal
 ```
 
 ```bash
-python -m wind_audio evaluate --audio-dir /path/to/audio \
+python -m wind_audio l1-test --audio-dir /path/to/audio \
   --labels /path/to/labels.csv --config config/l1.json --out reports/my_check
 ```
 

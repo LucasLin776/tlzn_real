@@ -1,4 +1,4 @@
-"""Training-free L1 windows, evaluation, review, and shared L2 commands."""
+"""Separate L1 detection (audio only) and testing (audio + labels) interfaces."""
 from __future__ import annotations
 
 import argparse
@@ -20,11 +20,8 @@ from .data import (
     anomaly_events,
     dataset_summary,
     import_simple,
-    label_mask,
     read_annotations,
     read_manifest,
-    regions_from_mask,
-    resolve_audio_path,
     validate_dataset,
     write_annotations,
 )
@@ -36,7 +33,6 @@ from .report import write_report, write_batch_report
 from .review import (
     export_template,
     import_reviews,
-    read_reviews,
     review_summary,
     reviews_to_annotations,
 )
@@ -228,6 +224,7 @@ def cmd_evaluate(args) -> int:
         iou_threshold=args.match_iou,
     )
     result["detector_config"] = detector.to_dict()
+    result["mode"] = "l1-test"
     result["selection"] = args.split if args.splits else "all_manifest"
     result["input"] = {"manifest": str(manifest.resolve()), "labels": args.labels,
                        "annotations": args.annotations, "pairing": args.pairing if args.audio_dir else None,
@@ -304,11 +301,8 @@ def _run_one(
     postprocess_source: str,
     fmax_plot: float,
     clip_context: float,
-    records: list[AudioRecord],
-    anns: list[Annotation],
-    manifest_path: Path | None = None,
-    reviews_by_id: dict | None = None,
 ) -> dict:
+    """Production inference accepts waveform paths and configuration only."""
     if clip_context < 0 or not np.isfinite(clip_context):
         raise ValueError("试听上下文必须为有限非负数")
     x, sr = load_wav(path, target_sr=cfg.sr)
@@ -316,17 +310,6 @@ def _run_one(
         raise ValueError(f"空音频: {path}")
     duration = len(x) / sr
     audio_id = path.stem
-    record = None
-    if manifest_path:
-        for rec in records:
-            try:
-                same = resolve_audio_path(rec, manifest_path).resolve() == path.resolve()
-            except Exception:
-                same = False
-            if same:
-                record = rec
-                audio_id = rec.audio_id
-                break
     bundle = extract_features(x, sr, cfg, audio_id)
     events, traces = detector.analyze(bundle, threshold=threshold, postprocess=postprocess)
     from .l2.common import digest, file_hash
@@ -335,9 +318,8 @@ def _run_one(
         ev["event_id"] = audio_id + "_" + digest(
             [audio_hash, ev["start_s"], ev["end_s"], detector.version,
              cfg.to_dict(), threshold, postprocess])[:20]
-        ev["review"] = (reviews_by_id or {}).get(ev["event_id"])
-    regions = regions_from_mask(label_mask(record, anns, cfg.target_step)) if record else []
-    gt = anomaly_events(record, anns) if record else []
+    # Keep the existing report schema, but never load labels in detection mode.
+    regions, gt = [], []
 
     if (out_dir / "review.csv").exists():
         raise ValueError("输出目录已有审核记录，请使用新目录，避免覆盖人工标注")
@@ -382,6 +364,7 @@ def _run_one(
 
     payload = {
         "schema_version": "3.1",
+        "mode": "l1-detect",
         "audio": {
             "id": audio_id,
             "file": path.name,
@@ -405,7 +388,7 @@ def _run_one(
         "events": events,
         "diagnostics": {"level_floor_dbfs": traces["level_floor_dbfs"],
                         "rejected_candidates": traces["rejected_triggers"]},
-        "annotations": {"regions": regions, "gt_events": gt, "source": str(record.audio_id) if record else None},
+        "annotations": {"regions": [], "gt_events": [], "source": None},
     }
     _write_json(out_dir / "events.json", payload)
     _events_csv(events, out_dir / "events.csv")
@@ -429,7 +412,6 @@ def _run_one(
         events=events,
         regions=regions,
         gt_events=gt,
-        reviews=reviews_by_id,
         audio_relpath=audio_rel,
         review_relpath="review.csv",
     )
@@ -458,14 +440,6 @@ def cmd_run(args) -> int:
     detector = _detector_from_args(args)
     cfg = detector.feature_config
 
-    records, anns = [], []
-    if args.manifest:
-        records = read_manifest(args.manifest)
-        anns = read_annotations(args.annotations) if args.annotations else []
-    reviews_by_id = {}
-    if args.review:
-        reviews_by_id = {r.event_id: r.to_row() for r in read_reviews(args.review)}
-
     threshold = detector.threshold
     threshold_source = "cli" if args.threshold is not None else ("config" if args.config else "default")
     pp = detector.postprocess
@@ -487,9 +461,6 @@ def cmd_run(args) -> int:
                 threshold=thr, threshold_source=threshold_source,
                 postprocess=pp, postprocess_source=pp_source,
                 fmax_plot=args.fmax_plot, clip_context=args.clip_context,
-                records=records, anns=anns,
-                manifest_path=Path(args.manifest) if args.manifest else None,
-                reviews_by_id=reviews_by_id,
             )
         except Exception as exc:
             print(f"{path.name}: 跳过（{exc}）", file=sys.stderr)
@@ -499,7 +470,7 @@ def cmd_run(args) -> int:
         print(f"{path.name}: {result['events']} 事件 -> {result['report']}")
     if input_path.is_dir():
         out_base.mkdir(parents=True, exist_ok=True)
-        summary = {"files_requested": len(files), "files_succeeded": len(results), "failures": failures,
+        summary = {"mode": "l1-detect", "files_requested": len(files), "files_succeeded": len(results), "failures": failures,
                    "detector_config": detector.to_dict(), "files": results,
                    "total_events": sum(r["events"] for r in results),
                    "total_duration_s": sum(r["duration_s"] for r in results),
@@ -620,12 +591,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_split)
 
-    ev = sub.add_parser("evaluate", help="音频送入 L1，与标签比较，输出准确率和事件指标")
+    ev = sub.add_parser("l1-test", aliases=["evaluate"],
+                        help="L1 测试版：音频 + 标签 → 检验器 → 准确率/召回率/逐条对比",
+                        description="L1 测试版：必须提供音频和标签；标签仅用于检验，同检测版共用 L1 算法。")
     source = ev.add_mutually_exclusive_group(required=True)
     source.add_argument("--manifest", help="已有标准音频清单，搭配 --annotations")
     source.add_argument("--audio-dir", help="WAV 目录，搭配 --labels")
-    ev.add_argument("--annotations", help="标准 annotations.csv")
-    ev.add_argument("--labels", help="简易 CSV/JSON 文件，或 Name/Start/Duration 标注目录")
+    truth = ev.add_mutually_exclusive_group(required=True)
+    truth.add_argument("--annotations", help="标准 annotations.csv，搭配 --manifest")
+    truth.add_argument("--labels", help="简易 CSV/JSON 文件，或 Name/Start/Duration 标注目录，搭配 --audio-dir")
     ev.add_argument("--pairing", choices=["stem", "sorted"], default="stem",
                     help="标注目录配对：同名 stem；用户确认编号与音频排序一致才选 sorted")
     ev.add_argument("--assume-unlabeled-normal", action="store_true",
@@ -633,20 +607,19 @@ def build_parser() -> argparse.ArgumentParser:
     _add_detector_args(ev)
     ev.add_argument("--splits", help="可选固定划分；不传则评估整个清单")
     ev.add_argument("--split", choices=["val", "test"], default="test")
-    ev.add_argument("--out", default="reports/l1_evaluation")
+    ev.add_argument("--out", default="reports/l1_test")
     ev.add_argument("--match-iou", type=float, default=0.1)
     ev.set_defaults(func=cmd_evaluate)
 
-    r = sub.add_parser("run", help="直接检测频谱波动，输出异常候选窗口与切片")
-    r.add_argument("--input", required=True)
+    r = sub.add_parser("l1-detect", aliases=["run"],
+                       help="L1 检测版：仅原始音频 → 候选事件、切片、可试听报告",
+                       description="L1 检测版：仅输入原始 WAV 或音频目录，不接收标签、清单或已审核记录。")
+    r.add_argument("--input", required=True, help="原始 WAV 文件路径或音频目录（递归扫描 WAV）")
     _add_detector_args(r)
-    r.add_argument("--out")
-    r.add_argument("--manifest")
-    r.add_argument("--annotations")
+    r.add_argument("--out", help="检测结果目录，包含事件、音频切片和 HTML 报告")
     r.add_argument("--fmax-plot", type=float, default=20000)
     r.add_argument("--clip-context", type=float, default=1.0,
                    help="仅试听切片额外上下文，不改变检测窗口")
-    r.add_argument("--review", help="已审核记录，用于报告展示")
     r.set_defaults(func=cmd_run)
 
     rex = sub.add_parser("review-export", help="从 events.json 导出审核模板")

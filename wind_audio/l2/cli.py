@@ -90,9 +90,9 @@ def cmd_pipeline(a):
     from ..cli import main
     source = Path(a.input)
     if not source.is_file():
-        raise ValueError("pipeline 接受单个 WAV；批量先使用 run，再逐份 l2-run")
+        raise ValueError("pipeline 接受单个 WAV；批量先使用 l1-detect，再逐份 l2-run")
     out = Path(a.out)
-    argv = ["run", "--input", str(source), "--out", str(out / "l1")]
+    argv = ["l1-detect", "--input", str(source), "--out", str(out / "l1")]
     if a.l1_config:
         argv += ["--config", a.l1_config]
     if a.l1_threshold is not None:
