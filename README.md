@@ -1,6 +1,6 @@
 # Wind Audio：风机音频两级检测
 
-当前工程版本 **0.6.1**，L1 配置版本 **spectral_event_v2**。
+当前工程版本 **0.7.0**，L1 配置版本 **spectral_event_v2**。
 
 | 层 | 输入与作用 | 输出 | 是否训练 |
 |---|---|---|---|
@@ -17,7 +17,8 @@ conda activate post_training
 cd /Users/shuoqinlin/Desktop/wind_audio
 ```
 
-L1 只用 NumPy；L2 的 CNN14 还需 PyTorch。依赖见 `requirements.txt`。
+L1 检测只用 NumPy；测试版默认生成图表/PDF，另需 Matplotlib 和 ReportLab；L2 的 CNN14 还需 PyTorch。
+依赖见 `requirements.txt`；当前 post_training 已安装图表/PDF 依赖。
 从工程目录可直接运行 `python -m wind_audio`，无需安装本项目。
 WAV 支持 8/16/32 位整数 PCM；24 位及浮点 WAV 需先转换。多声道平均为单声道。
 
@@ -36,7 +37,7 @@ WAV 支持 8/16/32 位整数 PCM；24 位及浮点 WAV 需先转换。多声道�
 
 ```bash
 python -m wind_audio l1-detect \
-  --input /Users/shuoqinlin/Desktop/B02/音频 \
+  --input /Users/shuoqinlin/Desktop/数据/B02/音频 \
   --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
   --out /Users/shuoqinlin/Desktop/wind_audio/runs/l1_detect_B02
 ```
@@ -49,11 +50,11 @@ python -m wind_audio l1-detect \
 
 ```bash
 python -m wind_audio l1-test \
-  --audio-dir /Users/shuoqinlin/Desktop/B02/音频 \
-  --labels /Users/shuoqinlin/Desktop/B02/标注 \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/B02/音频 \
+  --labels /Users/shuoqinlin/Desktop/数据/B02/标注 \
   --pairing sorted --assume-unlabeled-normal \
   --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
-  --out /Users/shuoqinlin/Desktop/wind_audio/reports/l1_test_B02
+  --out /Users/shuoqinlin/Desktop/输出结果/B02_visual_new
 ```
 
 本数据集已确认：B02-001～100 对应音频按时间排序；所有音频完整审核；
@@ -62,6 +63,17 @@ python -m wind_audio l1-test \
 输出目录必须为空或不存在，避免覆盖既有标注和评估结果。
 调整 `--threshold` 等参数或编辑配置后，用新的输出目录对比结果；测试命令不会自动训练 L1。
 确定参数后，检测版使用相同配置即可。正式测试集不应反复用于调参。
+
+测试版默认生成 `plots/0001_B02-001.png` 等逐录音对照图，并按音频 ID 的自然顺序
+汇总到 **`comparison.pdf`**，每条音频一页；`plots/index.csv` 保存页码、图片与原音频路径。
+每页有四块内容：波形、实际 L1 分数、原始事件对比、事件簇辅助对比。
+下面两张图均为上行标签、下行预测，共用同一秒数坐标；未匹配标签为红色，未匹配预测带橙边。
+
+事件簇默认将两侧间隔不超过 0.3 秒的区间分别合并，可用 `--plot-merge-gap 0.3` 调整，
+仅影响辅助图，不修改标签、预测和正式指标。原始事件图与指标采用相同的区间真值
+（重叠或相接标签取并集）；分数是实际 dB 值，不是概率。
+未审核区域用灰底表示；没有精确区间标签时会明确提示，不把整段粗标签画成异常区间。
+可用 `--no-plots` 只输出数值结果；中文字体默认使用系统字体，缺少时用 `--plot-font /path/to/font.ttf` 指定。
 
 现有默认配置的 B02 结果在 [评估简报](reports/l1_B02/brief.md)：
 
@@ -174,6 +186,7 @@ wind_audio/
   l1.py / features.py          局部频谱评分与特征
   windowing.py / detectors.py  持续活动跟踪与最终窗口
   evaluate.py / markers.py     准确率、事件指标、B02 标注导入
+  eval_plots.py               逐录音四联对照图与有序 PDF
   data.py / splits.py          数据校验与来源划分
   audio.py / events.py         WAV 处理、事件特征
   cli.py                      统一命令入口

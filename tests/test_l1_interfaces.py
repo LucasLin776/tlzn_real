@@ -12,6 +12,25 @@ from wind_audio import cli
 
 
 class L1InterfaceTests(unittest.TestCase):
+    def test_missing_input_reports_path_before_pairing_error(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            audio, labels, out = root / "audio", root / "labels", root / "out"
+            audio.mkdir()
+            for audio_path, labels_path, expected in (
+                    (audio, labels, "标注路径不存在"),
+                    (root / "missing_audio", labels, "音频目录不存在")):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    result = cli.main(["l1-test", "--audio-dir", str(audio_path),
+                                       "--labels", str(labels_path), "--pairing", "sorted",
+                                       "--out", str(out)])
+                self.assertEqual(result, 2)
+                self.assertIn(expected, stderr.getvalue())
+                self.assertIn(str(labels_path if audio_path == audio else audio_path), stderr.getvalue())
+                self.assertNotIn("--pairing 仅用于", stderr.getvalue())
+                self.assertFalse(out.exists())
+
     def test_detection_rejects_every_label_input_including_old_alias(self):
         for command in ("l1-detect", "run"):
             for flag in ("--labels", "--annotations", "--manifest", "--review"):

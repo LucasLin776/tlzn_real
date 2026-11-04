@@ -9,6 +9,7 @@ import math
 import re
 import shutil
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -195,8 +196,15 @@ def cmd_evaluate(args) -> int:
     if args.audio_dir:
         if not args.labels or args.annotations:
             raise ValueError("--audio-dir 必须搭配 --labels，不能同时传 --annotations")
+        audio_dir, labels_path = Path(args.audio_dir), Path(args.labels)
+        if not audio_dir.is_dir():
+            raise ValueError(f"音频目录不存在或不是目录（--audio-dir）: {audio_dir}")
+        if not labels_path.exists():
+            raise ValueError(f"标注路径不存在（--labels）: {labels_path}；请检查目录名称和层级顺序")
+        if not (labels_path.is_dir() or labels_path.is_file()):
+            raise ValueError(f"标注路径必须是文件或目录（--labels）: {labels_path}")
         manifest = out / "manifest.csv"
-        if Path(args.labels).is_dir():
+        if labels_path.is_dir():
             from .markers import import_markers
             records, anns, warnings = import_markers(
                 args.audio_dir, args.labels, manifest, out / "annotations.csv",
@@ -219,10 +227,19 @@ def cmd_evaluate(args) -> int:
         audio_ids = split.ids(args.split)
     else:
         audio_ids = [r.audio_id for r in records]
-    result = evaluate_detector(
-        detector, records, anns, audio_ids, manifest, detector.feature_config,
-        iou_threshold=args.match_iou,
-    )
+    from .eval_plots import ComparisonReport, natural_key
+    audio_ids = sorted(audio_ids, key=natural_key)
+    report_context = (nullcontext(None) if args.no_plots else
+                      ComparisonReport(out, cluster_gap=args.plot_merge_gap, font_path=args.plot_font))
+    with report_context as report:
+        result = evaluate_detector(
+            detector, records, anns, audio_ids, manifest, detector.feature_config,
+            iou_threshold=args.match_iou, on_file=report.add if report else None,
+        )
+        if result["file_accuracy"] is None and result["time_accuracy"] is None:
+            raise ValueError("没有可评估标签；请提供文件标签、精确区间，或确认完整审核后设置 --assume-unlabeled-normal")
+    if report is not None:
+        result["visual_report"] = report.metadata()
     result["detector_config"] = detector.to_dict()
     result["mode"] = "l1-test"
     result["selection"] = args.split if args.splits else "all_manifest"
@@ -230,8 +247,6 @@ def cmd_evaluate(args) -> int:
                        "annotations": args.annotations, "pairing": args.pairing if args.audio_dir else None,
                        "assume_unlabeled_normal": args.assume_unlabeled_normal}
     result["warnings"] = warnings
-    if result["file_accuracy"] is None and result["time_accuracy"] is None:
-        raise ValueError("没有可评估标签；请提供文件标签、精确区间，或确认完整审核后设置 --assume-unlabeled-normal")
     metrics, brief = write_eval_outputs(result, args.out)
     from .evaluate import _percent
     print(f"文件准确率={_percent(result['file_accuracy'])}；时长准确率={_percent(result['time_accuracy'])}")
@@ -243,6 +258,8 @@ def cmd_evaluate(args) -> int:
     for warning in warnings:
         print(f"提示: {warning}")
     print(f"输出: {metrics}, {brief}, {out / 'per_file.csv'}, {out / 'events.csv'}")
+    if report is not None:
+        print(f"对照图: {out / 'plots'}；汇总 PDF: {report.final_pdf}（{len(report.pages)} 页）")
     return 0
 
 
@@ -609,6 +626,10 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--split", choices=["val", "test"], default="test")
     ev.add_argument("--out", default="reports/l1_test")
     ev.add_argument("--match-iou", type=float, default=0.1)
+    ev.add_argument("--plot-merge-gap", type=float, default=.3,
+                    help="辅助事件簇对比图的合并间隔，默认 0.3 秒；不改变标签和正式指标")
+    ev.add_argument("--plot-font", help="可选中文 TTF/TTC 字体路径；默认自动寻找系统中文字体")
+    ev.add_argument("--no-plots", action="store_true", help="仅输出数值评估，跳过逐音频图片和 PDF")
     ev.set_defaults(func=cmd_evaluate)
 
     r = sub.add_parser("l1-detect", aliases=["run"],

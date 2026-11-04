@@ -32,6 +32,10 @@ L2 使用候选窗口和原音频，通过冻结的 PANNs CNN14 提取特征，�
 6. **汇总与输出**：`evaluate.py` 计算文件、时长和事件指标，写 JSON、CSV 和中文简报。
    所有文件累加计数/时长后再计算准确率，不平均逐文件百分比；零分母输出 null。
    输出目录非空时拒绝覆盖；数据错误返回非零状态。
+7. **对照图与 PDF**：同一次推理将波形、真实变化/活动分数与最终窗口交给 `eval_plots.py`，
+   逐录音生成四联图；下方两图都是标签在上、预测在下，分别展示原始事件和短间隔合并后的事件簇。
+   不重复运行模型，按音频 ID 自然顺序将图片编入 `comparison.pdf`，一条音频一页。
+   事件簇仅供诊断，不修改原始标签、预测或指标；未审核区域灰底显示，粗标签不展开成区间。
 
 ## 3. B02 运行命令
 
@@ -39,16 +43,18 @@ L2 使用候选窗口和原音频，通过冻结的 PANNs CNN14 提取特征，�
 conda activate post_training
 cd /Users/shuoqinlin/Desktop/wind_audio
 python -m wind_audio l1-test \
-  --audio-dir /Users/shuoqinlin/Desktop/B02/音频 \
-  --labels /Users/shuoqinlin/Desktop/B02/标注 \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/B02/音频 \
+  --labels /Users/shuoqinlin/Desktop/数据/B02/标注 \
   --pairing sorted \
   --assume-unlabeled-normal \
   --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
   --match-iou 0.1 \
-  --out /Users/shuoqinlin/Desktop/wind_audio/reports/l1_test_B02
+  --out /Users/shuoqinlin/Desktop/输出结果/B02_visual_new
 ```
 
 首次结果已保存于 `reports/l1_B02`；重跑使用新的输出目录。
+图表参数：`--plot-merge-gap 0.3` 调整辅助事件簇间隔；`--plot-font` 指定中文字体；
+`--no-plots` 关闭图片/PDF，仅输出数值。正常文件也生成一页，明确标示无标签事件或无预测事件。
 原 B02 目录只读，不复制音频，不改标注。用户已确认：
 
 - B02-001～100 对应按文件名时间从早到晚排序的 100 条音频。
@@ -141,6 +147,9 @@ python -m wind_audio l1-test --audio-dir /path/to/audio \
 | `events.csv` | 预测/真值窗口、匹配索引、IoU；索引从 0 开始 |
 | `manifest.csv` / `annotations.csv` | 导入后的标准输入快照；直接用已有清单时不重复生成 |
 | `pairing.csv` | 标注目录与原音频路径的明确对应关系 |
+| `plots/*.png` | 每条音频的波形、分数、上下行区间对比图 |
+| `plots/index.csv` | 页码、音频 ID、原音频路径、图片路径 |
+| `comparison.pdf` | 所有对照图按音频 ID 自然顺序汇总，每条一页，含音频书签 |
 
 文件级 TP 不能证明告警发生在正确时间；区间级结果提供这个核对依据。
 指标不使用标签类别区分，不依赖 L2 权重。

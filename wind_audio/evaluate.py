@@ -187,6 +187,7 @@ def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1):
         "time_metrics": time, "time_accuracy": time["accuracy"],
         "predicted_events": pred_events, "ground_truth_events": gt, "matches": match_details,
         "annotations": [a.to_row() for a in anns if a.audio_id == record.audio_id],
+        "iou_threshold": iou_threshold,
     }
 
 
@@ -256,6 +257,7 @@ def evaluate_detector(
     threshold: float | None = None,
     postprocess: dict | None = None,
     iou_threshold: float = 0.1,
+    on_file=None,
 ) -> dict:
     by_id = {r.audio_id: r for r in records}
     if not audio_ids:
@@ -266,13 +268,18 @@ def evaluate_detector(
     if missing:
         raise ValueError(f"评估集合引用不存在的 audio_id: {sorted(missing)}")
     rows = []
-    for audio_id in audio_ids:
+    for index, audio_id in enumerate(audio_ids, 1):
         rec = by_id[audio_id]
         x, sr = load_wav(resolve_audio_path(rec, manifest_path), target_sr=cfg.sr)
         bundle = extract_features(x, sr, cfg, audio_id)
-        pred = detector.predict_events(bundle, threshold=threshold, postprocess=postprocess)
+        if on_file is None:
+            pred = detector.predict_events(bundle, threshold=threshold, postprocess=postprocess)
+        else:
+            pred, traces = detector.analyze(bundle, threshold=threshold, postprocess=postprocess)
         row = evaluate_file_events(rec, anns, pred, iou_threshold)
         row["audio_path"] = str(resolve_audio_path(rec, manifest_path))
+        if on_file is not None:
+            on_file(rec, anns, x, sr, bundle, traces, row, detector, index, len(audio_ids))
         rows.append(row)
     overall = aggregate_file_metrics(rows)
     overall["threshold"] = float(detector.threshold if threshold is None else threshold)
@@ -351,6 +358,11 @@ def write_eval_outputs(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
         "逐文件对比见 per_file.csv；预测/真值窗口及一对一匹配见 events.csv（index 从 0 开始）。",
         "完整参数、原始标签、预测及匹配细节见 metrics.json。",
     ]
+    if result.get("visual_report"):
+        report = result["visual_report"]
+        lines += ["", f"逐音频对照图：plots/；顺序索引：{report['image_index']}。",
+                  f"汇总 PDF：{report['pdf']}，共 {report['pages']} 页，每条音频一页。",
+                  f"下方事件簇图按 {report['cluster_gap_s']:g} 秒间隔合并，仅供观察，不改变以上指标。"]
     (out / "brief.md").write_text("\n".join(lines), encoding="utf-8")
     return out / "metrics.json", out / "brief.md"
 

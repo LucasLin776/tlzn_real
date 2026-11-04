@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wind-audio"
-version = "0.6.1"
+version = "0.7.0"
 description = "Training-free spectral windows and reviewed PANNs continual learning"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24,<3", "torch>=2.6,<3"]
+dependencies = ["numpy>=1.24,<3", "torch>=2.6,<3", "matplotlib>=3.8,<4", "reportlab>=4,<5"]
 
 [project.optional-dependencies]
 dev = ["build>=1.2,<2", "ruff>=0.9,<1"]
