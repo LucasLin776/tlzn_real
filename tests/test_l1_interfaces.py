@@ -58,7 +58,7 @@ class L1InterfaceTests(unittest.TestCase):
             with patch("wind_audio.cli.read_manifest", side_effect=AssertionError("manifest read")), \
                     patch("wind_audio.cli.read_annotations", side_effect=AssertionError("labels read")):
                 self.assertEqual(cli.main(["l1-detect", "--input", str(audio / "event.wav"),
-                                           "--threshold", "7", "--out", str(detect_out)]), 0)
+                                           "--trigger-change-z", "2", "--out", str(detect_out)]), 0)
             detection = json.loads((detect_out / "events.json").read_text())
             self.assertEqual(detection["mode"], "l1-detect")
             self.assertEqual(detection["annotations"], {"regions": [], "gt_events": [], "source": None})
@@ -69,10 +69,11 @@ class L1InterfaceTests(unittest.TestCase):
                 labels, test_out = root / f"{truth}.csv", root / f"test_{truth}"
                 labels.write_text(f"file,label\nevent.wav,{truth}\n")
                 self.assertEqual(cli.main(["l1-test", "--audio-dir", str(audio), "--labels", str(labels),
-                                           "--threshold", "7", "--out", str(test_out)]), 0)
+                                           "--trigger-change-z", "2", "--out", str(test_out)]), 0)
                 result = json.loads((test_out / "metrics.json").read_text())
                 self.assertEqual(result["mode"], "l1-test")
-                self.assertEqual(result["detector_config"]["threshold"], 7)
+                self.assertEqual(result["detector_config"]["version"], "spectral_stability_v3")
+                self.assertEqual(result["detector_config"]["event"]["trigger_change_z"], 2)
                 predicted = result["per_file"][0]["predicted_events"]
                 self.assertEqual(windows, [(e["start_s"], e["end_s"]) for e in predicted])
                 self.assertEqual(result["file_accuracy"], 1 if truth == "anomaly" else 0)

@@ -119,6 +119,11 @@ def write_report(
     spectrogram_name: str = "spectrogram.png",
     waveform_name: str = "waveform.png",
     score_name: str = "score.png",
+    charts: list[dict] | None = None,
+    settings: list[tuple[str, str]] | None = None,
+    quality: dict | None = None,
+    stable_summary: dict | None = None,
+    threshold_unit: str = "dB change",
 ) -> Path:
     out = Path(out_dir)
     event_rows = []
@@ -132,6 +137,7 @@ def write_report(
         window_path = (ev.get("window") or {}).get("path", "")
         window_link = f'<a href="{html.escape(window_path)}">检测窗口 WAV</a>' if window_path else "-"
         boundary = {"background_return": "背景恢复", "new_stable_state": "新工况稳定",
+                    "return_to_learned_normal": "恢复到学得的正常波动范围",
                     "end_of_file": "到文件末尾，结束未确认"}.get(ev.get("boundary_reason"), "-")
         event_rows.append(
             "<tr>"
@@ -162,13 +168,41 @@ def write_report(
         )
     region_table = "\n".join(region_rows) if region_rows else '<tr><td colspan="4">无标注</td></tr>'
 
-    banner = (
-        '<div class="ok"><b>完整事件跟踪＋微弱噪声过滤（无需训练）</b>：变化触发后，'
-        '继续跟踪持续段和衰减尾部，不以边缘分数回落作为结束。候选不等于已确认故障；'
-        '稳定新工况可结束事件，无需恢复旧幅值。边界和过滤门槛仍需人工检验。</div>'
-    )
+    if detector_type == "normal_envelope":
+        banner = (
+            '<div class="ok"><b>正常样本学习模型</b>：从人工标注正常片段学习允许的频谱时间波动，'
+            '超出正常范围且通过强度/持续时间过滤后输出候选异常。绿色区间是模型预测正常，'
+            '不是人工审核结论；候选异常也不等于故障。检测时不读取标注、不更新模型。</div>'
+        )
+    elif stable_summary:
+        banner = (
+            '<div class="ok"><b>平稳段模式</b>：模型直接输出「频谱平稳」的时间段（绿色区间）；'
+            '异常事件由「整段录音减去平稳段」自动得到（橙色窗口）。'
+            '平稳判据与阈值来自平稳帧的分布标定，不依赖具体音色、频率位置或响度。</div>'
+        )
+    elif detector_type == "spectral_stability":
+        banner = (
+            '<div class="ok"><b>多尺度稳定性检测（无需训练）</b>：只有超过局部噪声容差的明显时频变化才触发；'
+            '频谱稳定达到确认时长后事件结束，并直接接受新背景——不要求形状、频率或响度回到旧状态。'
+            '候选不等于已确认故障，边界仍需人工抽检。</div>'
+        )
+    else:
+        banner = (
+            '<div class="ok"><b>完整事件跟踪＋微弱噪声过滤（无需训练）</b>：变化触发后，'
+            '继续跟踪持续段和衰减尾部，不以边缘分数回落作为结束。候选不等于已确认故障；'
+            '稳定新工况可结束事件，无需恢复旧幅值。边界和过滤门槛仍需人工检验。</div>'
+        )
     total_alarm = sum(ev["duration_s"] for ev in events)
-    threshold_unit = "dB change"
+    region_title = "模型预测正常区间（非人工标注）" if detector_type == "normal_envelope" else "人工标注区间"
+    learning_note = ("正常模型已用独立正常片段拟合/校准；当前音频只做推理，未加载人工标注。"
+                     if detector_type == "normal_envelope" else
+                     "标注仅用于检验窗口；未审核区域不当正常，整段粗标不展开成精确真值。")
+    waveform_caption = ("绿色=模型预测正常，橙色框=候选异常；均未经人工确认。"
+                        if detector_type == "normal_envelope" else
+                        "绿色=已审核正常，红色=已审核异常，灰色=未审核；橙色框=模型事件。")
+    spectrogram_caption = ("橙色矩形=候选异常；顶部绿色=模型预测正常（非人工标注）。颜色越亮能量越强。"
+                           if detector_type == "normal_envelope" else
+                           "橙色完整矩形=候选事件窗口（持续段＋尾部）；顶部色带为人工标注。颜色越亮能量越强。")
     y_wave = [(0.0, "+1"), (50.0, "0"), (100.0, "−1")]
     y_spec = [(0.0, _fmt(analyzed_fmax / 1000, 1) + "k"), (25.0, _fmt(analyzed_fmax * 0.75 / 1000, 1) + "k"),
               (50.0, _fmt(analyzed_fmax / 2 / 1000, 1) + "k"), (75.0, _fmt(analyzed_fmax * 0.25 / 1000, 1) + "k"),
@@ -180,14 +214,41 @@ def write_report(
         f"target_step={feature_config.get('target_step')}s · compare={feature_config.get('compare_s')}s · "
         f"smooth={feature_config.get('smooth_s')}s"
     )
-    post_txt = (
-        f"min_duration={postprocess.get('min_duration')}s · merge_gap={postprocess.get('merge_gap')}s · "
-        f"low_ratio={postprocess.get('low_ratio')} · padding={postprocess.get('padding')}s · "
-        f"reference={postprocess.get('reference_s')}s · release={postprocess.get('release_db')}dB · "
-        f"quiet={postprocess.get('quiet_s')}s · settle={postprocess.get('settle_s')}s · "
-        f"stability={postprocess.get('stability_db')}dB · prominence={postprocess.get('min_prominence')} · "
-        f"relative_floor={postprocess.get('relative_floor_db')}dB"
-    )
+    if settings:
+        settings_html = "".join(f"<li><b>{html.escape(k)}</b>：{html.escape(v)}</li>" for k, v in settings)
+    else:
+        post_txt = (
+            f"min_duration={postprocess.get('min_duration')}s · merge_gap={postprocess.get('merge_gap')}s · "
+            f"low_ratio={postprocess.get('low_ratio')} · padding={postprocess.get('padding')}s · "
+            f"reference={postprocess.get('reference_s')}s · release={postprocess.get('release_db')}dB · "
+            f"quiet={postprocess.get('quiet_s')}s · settle={postprocess.get('settle_s')}s · "
+            f"stability={postprocess.get('stability_db')}dB · prominence={postprocess.get('min_prominence')} · "
+            f"relative_floor={postprocess.get('relative_floor_db')}dB"
+        )
+        settings_html = f"<li><b>后处理</b>：{html.escape(post_txt)}</li>"
+    if quality:
+        clip = quality.get("clip_ratio") or 0.0
+        crest = quality.get("crest_db")
+        quality_html = (
+            f"<li><b>录音质量</b>：削顶采样占比 {clip:.2%}，波峰因数 {_fmt(crest, 1)} dB"
+            + ("（<span class='warn-inline'>削顶会压缩动态范围，仅作诊断，未修改原始波形</span>）"
+               if clip >= 0.001 else "")
+            + "</li>"
+        )
+        settings_html += quality_html
+
+    if charts:
+        chart_html = "\n".join(
+            _plot_block(item["image"], item["title"], item.get("caption", ""), duration)
+            for item in charts)
+    else:
+        chart_html = "\n".join([
+            _plot_block(score_name, "边缘触发分数（不是事件持续分数）",
+                        f"红色虚线=触发阈值 {_fmt(threshold, 4)}；分数回落不代表事件结束。", duration),
+            _plot_block("activity.png", "相对事件前背景的持续活动分数",
+                        f"红线=释放阈值 {_fmt(postprocess.get('release_db'), 2)} dB；"
+                        "需连续安静或新工况稳定才结束。", duration),
+        ])
     review_html = (
         f'<p class="note">审核模板：<a href="{html.escape(review_relpath)}">{html.escape(review_relpath)}</a>'
         "（填写后用 <code>review-import</code> 导入；L2 字段与 L1 字段独立）</p>"
@@ -232,6 +293,7 @@ def write_report(
   audio {{ height:28px; max-width:220px; }}
   .dot {{ display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:6px; }}
   .dot.normal {{ background:#7fc896; }} .dot.anomaly {{ background:#e28a7a; }} .dot.uncertain {{ background:#b9bec5; }}
+  ul.note {{ margin:6px 0 0 18px; padding:0; }} .warn-inline {{ color:#8a321d; }}
   details {{ margin-top:6px; }}
   a {{ color:var(--accent); }}
 </style></head><body><div class="wrap">
@@ -244,7 +306,7 @@ def write_report(
     <div class="kpi"><div class="v">{total_alarm:.2f}s</div><div class="l">报警总时长</div></div>
     <div class="kpi"><div class="v">{_fmt(threshold, 4)} {threshold_unit}</div><div class="l">阈值（{html.escape(threshold_source)}）</div></div>
     <div class="kpi"><div class="v">{html.escape(detector_type)}</div><div class="l">L1 检测器</div></div>
-    <div class="kpi"><div class="v">待审核</div><div class="l">L2 故障类型</div></div>
+    <div class="kpi"><div class="v">{_fmt((stable_summary or {}).get("stable_s"), 1)}s</div><div class="l">平稳段总时长（{int((stable_summary or {}).get("segments", 0))} 段）</div></div>
   </div></div>
 
   <div class="card">
@@ -253,10 +315,9 @@ def write_report(
   </div>
 
   <div class="card">
-    {_plot_block(waveform_name, "波形（时间轴：秒；含人工标注明暗）", "绿色=已审核正常，红色=已审核异常，灰色=未审核；橙色框=模型事件。", duration, y_labels=y_wave)}
-    {_plot_block(spectrogram_name, "时频图（时间轴：秒；线性频率，低频在下）", "橙色完整矩形=候选事件窗口（持续段＋尾部）；顶部色带为人工标注。颜色越亮能量越强。", duration, y_labels=y_spec)}
-    {_plot_block(score_name, "边缘触发分数（不是事件持续分数）", f"红色虚线=触发阈值 {_fmt(threshold, 4)}；分数回落不代表事件结束。", duration)}
-    {_plot_block("activity.png", "相对事件前背景的持续活动分数", f"红线=释放阈值 {_fmt(postprocess.get('release_db'), 2)} dB；需连续安静或新工况稳定才结束。过滤掉的候选可能仍有曲线，但没有事件框。", duration)}
+    {_plot_block(waveform_name, "波形（时间轴：秒）", waveform_caption, duration, y_labels=y_wave)}
+    {_plot_block(spectrogram_name, "时频图（时间轴：秒；线性频率，低频在下）", spectrogram_caption, duration, y_labels=y_spec)}
+    {chart_html}
   </div>
 
   <div class="card">
@@ -271,17 +332,17 @@ def write_report(
   </div>
 
   <div class="card">
-    <div class="plot-title">人工标注区间</div>
+    <div class="plot-title">{region_title}</div>
     <table><thead><tr><th>标签</th><th>起止 (s)</th><th>时长 (s)</th><th>状态</th></tr></thead>
     <tbody>{region_table}</tbody></table>
-    <p class="note">L1 不需要训练。标注仅用于检验窗口；未审核区域不当正常，整段粗标不展开成精确真值。</p>
+    <p class="note">{learning_note}</p>
   </div>
 
   <div class="card"><details><summary>模型、特征与后处理参数</summary>
     <p class="note">模型 <code>{html.escape(model_version)}</code> · 检测器 {html.escape(detector_type)} ·
       分数类型 <code>{html.escape(score_type)}</code> · 阈值 {_fmt(threshold, 4)}（来源 {html.escape(threshold_source)}）</p>
     <p class="note">特征：{html.escape(cfg_txt)}</p>
-    <p class="note">后处理：{html.escape(post_txt)}</p>
+    <ul class="note">{settings_html}</ul>
     <p class="note">逐时刻触发、活动、显著性、能量和窗口状态见 <a href="scores.csv">scores.csv</a>。
     <a href="events.json">events.json</a> 保留过滤原因；相对能量过滤可能漏掉较弱的真实异常。</p>
     <p class="note">本报告只定位“明显频谱波动”，不确认异常或机械故障类型；L2 未训练时统一为“待审核/未训练”。</p>

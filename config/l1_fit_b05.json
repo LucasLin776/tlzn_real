@@ -1,0 +1,101 @@
+{
+  "schema_version": 2,
+  "detector": "spectral_stability",
+  "version": "spectral_stability_v3",
+  "feature_config": {
+    "sr": 44100,
+    "n_fft": 2048,
+    "hop": 441,
+    "n_mels": 64,
+    "fmin": 20.0,
+    "fmax": 16000.0,
+    "target_step": 0.02,
+    "compare_s": 0.1,
+    "smooth_s": 0.06,
+    "dynamic_range_db": 40.0
+  },
+  "stability": {
+    "fast_s": 0.1,
+    "smooth_s": 0.03,
+    "noise_s": 2.0,
+    "stable_s": 0.6,
+    "drift_s": 0.4,
+    "slow_s": 1.0,
+    "slow_cal_s": 20.0,
+    "slow_scale": 2.0,
+    "slow_floor_db": 0.6,
+    "slow_cap_db": 8.0,
+    "bg_s": 2.0,
+    "bg_lag_s": 0.2,
+    "excess_cal_s": 5.0,
+    "excess_scale": 3.0,
+    "excess_floor_db": 0.8,
+    "excess_cap_db": 12.0,
+    "band_z": 4.944975610475193,
+    "active_range_db": 30.0,
+    "weight_exp": 0.25,
+    "sigma_floor_db": 0.35,
+    "sigma_cap_db": 6.0,
+    "fluct_scale": 1.364,
+    "fluct_floor_db": 0.6,
+    "drift_scale": 1.911,
+    "drift_floor_db": 0.6,
+    "stable_band_frac": 0.806,
+    "stable_change_z": 2.3
+  },
+  "event": {
+    "trigger_change_z": 2.1675178589622996,
+    "trigger_exceed": 0.15369233565265286,
+    "trigger_frames": 3,
+    "strong_factor": 1.5,
+    "wide_factor": 0.8,
+    "wide_exceed_factor": 2.0,
+    "slow_ratio_trigger": 1.7554629041809238,
+    "slow_frames": 10,
+    "confirm_s": 4.0,
+    "confirm_ratio": 0.9,
+    "hold_s": 0.2,
+    "slow_min_duration": 0.5,
+    "release_mode": "stable",
+    "segment_mode": "state",
+    "state_enter_s": 0.2,
+    "quiet_change_ratio": 0.7338891383159939,
+    "quiet_exceed_ratio": 0.40458281797336476,
+    "quiet_excess": 0.05166322884883653,
+    "min_duration": 0.06,
+    "padding": 0.0,
+    "init_s": 0.5,
+    "backdate_s": 0.6,
+    "output_mode": "stable"
+  },
+  "fit": {
+    "method": "stable-frames tail calibration + temporal train/validation split",
+    "fit_files": 67,
+    "validation_files": 29,
+    "calibration": {
+      "trigger_alpha": 0.001,
+      "stable_alpha": 0.01,
+      "quantiles": {
+        "change_z": 0.999,
+        "exceed": 0.999,
+        "fluct_ratio": 0.99,
+        "drift_ratio": 0.99,
+        "peak_change": 0.99,
+        "band_frac": 0.01
+      }
+    },
+    "selected": {
+      "segment_mode": "state",
+      "confirm_s": 4.0,
+      "alpha_stable": 0.01
+    },
+    "validation": {
+      "time_f1": 0.688,
+      "time_accuracy": 0.703,
+      "time_recall": 0.69,
+      "time_precision": 0.686,
+      "coverage": 0.473,
+      "event_f1": 0.554
+    }
+  }
+}

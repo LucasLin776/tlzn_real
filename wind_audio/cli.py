@@ -26,7 +26,10 @@ from .data import (
     validate_dataset,
     write_annotations,
 )
-from .detectors import SpectralChangeDetector, load_detector
+from .detectors import SpectralChangeDetector, StabilityDetector, load_detector
+from .normal import NormalConfig, NormalModelDetector
+from .stability import StabilityConfig
+from .state import EventConfig
 from .evaluate import evaluate_detector, write_eval_outputs
 from .features import FeatureConfig, extract_features
 from .render import score_png, spectrogram_png, waveform_png
@@ -38,6 +41,7 @@ from .review import (
     reviews_to_annotations,
 )
 from .splits import assert_no_leakage, load_splits, make_splits, save_splits
+from .stability import audio_quality
 
 
 # --------------------------------------------------------------------- utils
@@ -67,25 +71,80 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", name)[:80] or "audio"
 
 
+# Command-line flags that only make sense for one detector generation.
+LEGACY_ONLY_ARGS = {"threshold", "merge_gap", "low_ratio", "reference_s", "release_db",
+                    "quiet_s", "settle_s", "stability_db", "min_prominence",
+                    "relative_floor_db"}
+V3_ONLY_ARGS = {"trigger_change_z", "trigger_exceed", "trigger_frames", "slow_ratio_trigger",
+                "slow_frames", "slow_min_duration", "confirm_s", "stable_s", "noise_s", "band_z",
+                "init_s", "backdate_s", "fast_s", "drift_s", "sigma_floor_db", "sigma_cap_db",
+                "fluct_scale", "drift_scale", "stable_band_frac", "active_range_db",
+                "weight_exp", "slow_scale", "excess_scale"}
+
+
+def _provided(args) -> dict:
+    return {k: v for k, v in vars(args).items() if v is not None}
+
+
 def _detector_from_args(args):
+    """Build a detector from config + CLI overrides, rejecting mismatched flags."""
     base = load_detector(args.config)
     cfg = base.feature_config.to_dict()
     for key in cfg:
         value = getattr(args, key, None)
         if value is not None:
             cfg[key] = value
-    pp = dict(base.postprocess)
-    for arg, key in (("min_dur", "min_duration"), ("merge_gap", "merge_gap"),
-                     ("low_ratio", "low_ratio"), ("padding", "padding"),
-                     ("reference_s", "reference_s"), ("release_db", "release_db"),
-                     ("quiet_s", "quiet_s"), ("settle_s", "settle_s"),
-                     ("stability_db", "stability_db"), ("min_prominence", "min_prominence"),
-                     ("relative_floor_db", "relative_floor_db")):
-        value = getattr(args, arg, None)
-        if value is not None:
-            pp[key] = value
-    threshold = base.threshold if args.threshold is None else args.threshold
-    return SpectralChangeDetector(FeatureConfig.from_dict(cfg), threshold, pp)
+    provided = _provided(args)
+    if isinstance(base, NormalModelDetector):
+        clash = sorted(set(provided) & ((LEGACY_ONLY_ARGS - {"threshold", "merge_gap"}) | V3_ONLY_ARGS))
+        if clash:
+            raise ValueError(f"参数 {clash} 不适用于正常样本模型")
+        base.feature_config.assert_compatible(FeatureConfig.from_dict(cfg))
+        settings = base.normal.to_dict()
+        for arg, key in (("min_dur", "min_duration"), ("merge_gap", "merge_gap"), ("padding", "padding")):
+            if getattr(args, arg, None) is not None:
+                settings[key] = getattr(args, arg)
+        return NormalModelDetector(base.scales, base.threshold if args.threshold is None else args.threshold,
+                                   base.feature_config, NormalConfig(**settings), base.training)
+    if isinstance(base, SpectralChangeDetector):
+        clash = sorted(set(provided) & V3_ONLY_ARGS)
+        if clash:
+            raise ValueError(f"参数 {clash} 只适用于 spectral_stability_v3；当前配置是旧版 spectral_event_v2")
+        pp = dict(base.postprocess)
+        for arg, key in (("min_dur", "min_duration"), ("merge_gap", "merge_gap"),
+                         ("low_ratio", "low_ratio"), ("padding", "padding"),
+                         ("reference_s", "reference_s"), ("release_db", "release_db"),
+                         ("quiet_s", "quiet_s"), ("settle_s", "settle_s"),
+                         ("stability_db", "stability_db"), ("min_prominence", "min_prominence"),
+                         ("relative_floor_db", "relative_floor_db")):
+            value = getattr(args, arg, None)
+            if value is not None:
+                pp[key] = value
+        threshold = base.threshold if args.threshold is None else args.threshold
+        return SpectralChangeDetector(FeatureConfig.from_dict(cfg), threshold, pp)
+    clash = sorted(set(provided) & LEGACY_ONLY_ARGS)
+    if clash:
+        raise ValueError(f"参数 {clash} 只适用于旧版 spectral_event_v2；"
+                         "新版请使用 --trigger-change-z / --confirm-s 等参数")
+    stability, events = {}, {}
+    for name, target in ((("fast_s", "noise_s", "stable_s", "drift_s", "band_z",
+                           "sigma_floor_db", "sigma_cap_db", "fluct_scale", "drift_scale",
+                           "stable_band_frac", "active_range_db", "weight_exp",
+                           "slow_scale", "excess_scale"), stability),
+                         (("trigger_change_z", "trigger_exceed", "trigger_frames",
+                           "slow_ratio_trigger", "slow_frames", "slow_min_duration",
+                           "confirm_s", "init_s", "backdate_s"), events)):
+        for key in name:
+            value = getattr(args, key, None)
+            if value is not None:
+                target[key] = value
+    if args.min_dur is not None:
+        events["min_duration"] = args.min_dur
+    if args.padding is not None:
+        events["padding"] = args.padding
+    return StabilityDetector(FeatureConfig.from_dict(cfg),
+                             StabilityConfig(**{**base.stability.to_dict(), **stability}),
+                             EventConfig(**{**base.events.to_dict(), **events}))
 
 
 def _load_dataset(args, check_audio: bool = True):
@@ -199,6 +258,10 @@ def cmd_evaluate(args) -> int:
         audio_dir, labels_path = Path(args.audio_dir), Path(args.labels)
         if not audio_dir.is_dir():
             raise ValueError(f"音频目录不存在或不是目录（--audio-dir）: {audio_dir}")
+        if args.labels_are_stable and args.assume_unlabeled_normal:
+            raise ValueError("--labels-are-stable 与 --assume-unlabeled-normal 语义相反，不能同时使用")
+        if args.labels_are_stable and not labels_path.is_dir():
+            raise ValueError("--labels-are-stable 目前只支持 Audition 标注目录（--labels 传目录）")
         if not labels_path.exists():
             raise ValueError(f"标注路径不存在（--labels）: {labels_path}；请检查目录名称和层级顺序")
         if not (labels_path.is_dir() or labels_path.is_file()):
@@ -208,7 +271,15 @@ def cmd_evaluate(args) -> int:
             from .markers import import_markers
             records, anns, warnings = import_markers(
                 args.audio_dir, args.labels, manifest, out / "annotations.csv",
-                pairing=args.pairing, assume_unlabeled_normal=args.assume_unlabeled_normal)
+                pairing=args.pairing, assume_unlabeled_normal=args.assume_unlabeled_normal,
+                stable_markers=args.labels_are_stable)
+            if not args.labels_are_stable:
+                names = [a.fault_type for a in anns if a.fault_type]
+                calm = sum(1 for n in names if "正常" in n or "normal" in n.lower())
+                if names and calm * 2 >= len(names):
+                    warnings.append(
+                        f"标注中有 {calm}/{len(names)} 个名称含「正常」——若这批标的是平稳区间，"
+                        "请加 --labels-are-stable，否则平稳段会被当成异常，指标会整体反过来")
         else:
             if args.pairing != "stem":
                 raise ValueError("--pairing 仅用于标注目录")
@@ -245,7 +316,8 @@ def cmd_evaluate(args) -> int:
     result["selection"] = args.split if args.splits else "all_manifest"
     result["input"] = {"manifest": str(manifest.resolve()), "labels": args.labels,
                        "annotations": args.annotations, "pairing": args.pairing if args.audio_dir else None,
-                       "assume_unlabeled_normal": args.assume_unlabeled_normal}
+                       "assume_unlabeled_normal": args.assume_unlabeled_normal,
+                       "labels_are_stable": bool(getattr(args, "labels_are_stable", False))}
     result["warnings"] = warnings
     metrics, brief = write_eval_outputs(result, args.out)
     from .evaluate import _percent
@@ -290,6 +362,8 @@ def _events_csv(events: list[dict], path: Path) -> None:
         "trigger_start_s", "trigger_end_s", "window_path",
         "boundary_reason", "right_censored", "peak_activity_db", "peak_prominence",
         "peak_level_dbfs", "level_floor_dbfs",
+        "peak_change_z", "mean_change_z", "peak_exceed", "peak_slow_ratio",
+        "stable_confirmed_s", "trigger_change_z", "trigger_exceed",
         "clip_path", "clip_start_s", "clip_end_s",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -306,6 +380,31 @@ def _events_csv(events: list[dict], path: Path) -> None:
             writer.writerow(row)
 
 
+def settings_text(detector) -> list[tuple[str, str]]:
+    """Human-readable effective settings for the HTML report."""
+    if isinstance(detector, NormalModelDetector):
+        cfg = detector.normal
+        return [("学习方式", "只学习已标正常区间的频谱时间波动"),
+                ("正常偏离阈值", f"{detector.threshold:.3g}（不是概率）"),
+                ("轻微噪音过滤", f"连续 {cfg.enter_s:g} s，最短 {cfg.min_duration:g} s"),
+                ("正常恢复 / 合并间隔", f"{cfg.release_s:g} s / {cfg.merge_gap:g} s"),
+                ("特征尺度 dB", ", ".join(f"{v:.2f}" for v in detector.scales))]
+    if isinstance(detector, SpectralChangeDetector):
+        pp = detector.postprocess
+        return [("触发阈值", f"{detector.threshold:g} dB"),
+                ("持续活动释放", f"{pp['release_db']:g} dB"),
+                ("背景恢复确认", f"{pp['quiet_s']:g} s"),
+                ("新工况确认", f"{pp['settle_s']:g} s"),
+                ("显著性/响度过滤", f"{pp['min_prominence']:g} / {pp['relative_floor_db']:g} dB")]
+    st, ev = detector.stability, detector.events
+    return [("快速变化触发", f"{ev.trigger_change_z:g} σ 且超容差频带 ≥ {ev.trigger_exceed:.0%}"),
+            ("慢变化触发", f"{ev.slow_ratio_trigger:g} 倍容差，持续 {ev.slow_frames} 帧"),
+            ("局部噪声尺度", f"{st.noise_s:g} s 窗，{st.sigma_floor_db:g}–{st.sigma_cap_db:g} dB"),
+            ("稳定判据", f"{st.stable_band_frac:.0%} 频带在容差内，观察窗 {st.stable_s:g} s"),
+            ("稳定确认", f"{ev.confirm_s:g} s"),
+            ("最短事件 / 边界补充", f"{ev.min_duration:g} s / {ev.padding:g} s")]
+
+
 def _run_one(
     path: Path,
     detector,
@@ -314,6 +413,7 @@ def _run_one(
     *,
     threshold: float,
     threshold_source: str,
+    threshold_unit: str,
     postprocess: dict,
     postprocess_source: str,
     fmax_plot: float,
@@ -332,11 +432,16 @@ def _run_one(
     from .l2.common import digest, file_hash
     audio_hash = file_hash(path)
     for ev in events:
+        model_identity = (detector.to_dict() if isinstance(detector, NormalModelDetector)
+                          else detector.version)
         ev["event_id"] = audio_id + "_" + digest(
-            [audio_hash, ev["start_s"], ev["end_s"], detector.version,
+            [audio_hash, ev["start_s"], ev["end_s"], model_identity,
              cfg.to_dict(), threshold, postprocess])[:20]
     # Keep the existing report schema, but never load labels in detection mode.
-    regions, gt = [], []
+    segments = traces.get("stable_segments") or []
+    regions = [{"start_s": s["start_s"], "end_s": s["end_s"], "label": "normal"}
+               for s in segments]
+    gt = []
 
     if (out_dir / "review.csv").exists():
         raise ValueError("输出目录已有审核记录，请使用新目录，避免覆盖人工标注")
@@ -362,25 +467,52 @@ def _run_one(
         bundle.spec_db, bundle.freqs, bundle.mel_times, duration, events, regions,
         out_dir / "spectrogram.png", f_max=min(fmax_plot, cfg.fmax, sr / 2),
     )
-    score = traces["change_db"]
-    score_png(bundle.times, score, threshold, events, regions, duration, out_dir / "score.png")
-    score_png(bundle.times, traces["activity_db"], postprocess["release_db"], events, regions,
-              duration, out_dir / "activity.png")
-    with (out_dir / "scores.csv").open("w", encoding="utf-8", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["time_s", "change_db", "threshold_high", "threshold_low",
-                         "activity_db", "release_db", "prominence", "level_dbfs",
-                         "level_floor_dbfs", "event_active"])
-        writer.writerows(zip(bundle.times, score,
-                            np.full(len(score), threshold), np.full(len(score), threshold * postprocess["low_ratio"]),
-                            traces["activity_db"], np.full(len(score), postprocess["release_db"]),
-                            traces["prominence"], traces["level_dbfs"],
-                            np.full(len(score), traces["level_floor_dbfs"]), traces["active"].astype(int)))
-    effective_config = {**detector.to_dict(), "threshold": threshold, "postprocess": postprocess}
+    quality = audio_quality(x, sr)
+    curves = traces.get("curves") or []
+    chart_blocks = []
+    for curve in curves:
+        image = f"{curve['key']}.png"
+        score_png(bundle.times, curve["values"], curve["threshold"], events, regions,
+                  duration, out_dir / image)
+        chart_blocks.append({"image": image, "title": curve["title"],
+                             "caption": curve.get("note", "")})
+    extra = [("event_active", traces["active"].astype(int))]
+    for key in ("stable", "state", "level_dbfs", "sigma_db"):
+        if key in traces:
+            values = traces[key]
+            extra.append((key, values.astype(int) if key == "stable" else values))
+    columns = ["time_s"]
+    for curve in curves:
+        columns += [curve["key"], curve["key"] + "_threshold"]
+    columns += [key for key, _ in extra]
+    with (out_dir / "scores.csv").open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(columns)
+        series = [bundle.times]
+        for curve in curves:
+            series += [curve["values"], np.full(len(bundle.times), curve["threshold"])]
+        series += [values for _, values in extra]
+        writer.writerows(zip(*series))
+
+    effective_config = detector.to_dict()
+    if isinstance(detector, SpectralChangeDetector):
+        effective_config = {**effective_config, "threshold": threshold, "postprocess": postprocess}
     _write_json(out_dir / "l1_config.json", effective_config)
 
+    diagnostics = {"quality": quality,
+                   "output_mode": traces.get("output_mode", getattr(getattr(detector, "events", None),
+                                                                      "output_mode", "anomaly")),
+                   "anomaly_source": traces.get("anomaly_source",
+                                                "complement_of_stable" if segments else "detected_windows")}
+    for key in ("rejected_triggers", "near_miss", "context_insufficient",
+                "context_required_s", "available_s"):
+        if key in traces:
+            diagnostics["rejected_candidates" if key == "rejected_triggers" else key] = traces[key]
+    if "level_floor_dbfs" in traces:
+        diagnostics["level_floor_dbfs"] = traces["level_floor_dbfs"]
+
     payload = {
-        "schema_version": "3.1",
+        "schema_version": "4.0",
         "mode": "l1-detect",
         "audio": {
             "id": audio_id,
@@ -391,24 +523,23 @@ def _run_one(
             "sr": sr,
             "analyzed_fmax_hz": cfg.fmax,
         },
-        "model": {
-            "version": detector.version,
-            "detector": detector.detector_type,
-            "score_type": detector.score_type,
-            "threshold": threshold,
-            "threshold_source": threshold_source,
-            "postprocess": postprocess,
-            "postprocess_source": postprocess_source,
-            "requires_training": False,
-            "feature_config": cfg.to_dict(),
-        },
+        "model": {**{k: v for k, v in effective_config.items() if k != "schema_version"},
+                  "threshold_source": threshold_source,
+                  "postprocess_source": postprocess_source,
+                  "requires_training": bool(getattr(detector, "requires_training", False))},
         "events": events,
-        "diagnostics": {"level_floor_dbfs": traces["level_floor_dbfs"],
-                        "rejected_candidates": traces["rejected_triggers"]},
+        "stable_segments": segments,
+        "diagnostics": diagnostics,
         "annotations": {"regions": [], "gt_events": [], "source": None},
     }
     _write_json(out_dir / "events.json", payload)
     _events_csv(events, out_dir / "events.csv")
+    if segments:
+        with (out_dir / "stable_segments.csv").open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["index", "start_s", "end_s", "duration_s", "coverage"])
+            writer.writeheader()
+            for index, seg in enumerate(segments, 1):
+                writer.writerow({**seg, "index": index})
 
     export_template(payload, out_dir / "review.csv", out_dir / "review.json")
     report = write_report(
@@ -423,21 +554,32 @@ def _run_one(
         score_type=detector.score_type,
         threshold=threshold,
         threshold_source=threshold_source,
-
+        threshold_unit=threshold_unit,
         feature_config=cfg.to_dict(),
         postprocess=postprocess,
+        settings=settings_text(detector),
         events=events,
         regions=regions,
         gt_events=gt,
         audio_relpath=audio_rel,
         review_relpath="review.csv",
+        charts=chart_blocks,
+        quality=quality,
+        stable_summary=({"segments": len(segments),
+                         "stable_s": round(sum(s["duration_s"] for s in segments), 2),
+                         "coverage": round(sum(s["duration_s"] for s in segments) / duration, 3)}
+                        if segments else None),
     )
     return {"audio_id": audio_id, "file": path.name, "source": str(path.resolve()),
             "audio_sha256": audio_hash, "duration_s": duration,
             "events": len(events), "alarm_s": sum(e["duration_s"] for e in events),
             "windows": [{"start_s": e["start_s"], "end_s": e["end_s"],
                          "right_censored": e["right_censored"]} for e in events],
-            "filtered_candidates": len(traces["rejected_triggers"]),
+            "filtered_candidates": len(traces.get("rejected_triggers", [])),
+            "near_miss": len(traces.get("near_miss", [])),
+            "clip_ratio": quality["clip_ratio"],
+            "stable_segments": len(segments),
+            "stable_s": round(sum(s["duration_s"] for s in segments), 2),
             "report": str(report), "out": str(out_dir)}
 
 
@@ -457,9 +599,20 @@ def cmd_run(args) -> int:
     detector = _detector_from_args(args)
     cfg = detector.feature_config
 
-    threshold = detector.threshold
-    threshold_source = "cli" if args.threshold is not None else ("config" if args.config else "default")
-    pp = detector.postprocess
+    if isinstance(detector, NormalModelDetector):
+        threshold, pp = detector.threshold, {}
+        threshold_unit = "正常偏离倍数"
+        threshold_source = "cli" if args.threshold is not None else "normal_calibration"
+    elif isinstance(detector, SpectralChangeDetector):
+        threshold = detector.threshold
+        pp = detector.postprocess
+        threshold_unit = "dB change"
+        threshold_source = "cli" if args.threshold is not None else ("config" if args.config else "default")
+    else:
+        threshold = detector.events.trigger_change_z
+        pp = {}
+        threshold_unit = "噪声σ"
+        threshold_source = "cli" if args.trigger_change_z is not None else ("config" if args.config else "default")
     pp_source = "effective_config"
 
     out_base = Path(args.out) if args.out else Path("runs")
@@ -476,6 +629,7 @@ def cmd_run(args) -> int:
             result = _run_one(
                 path, det, cfg, out_dir,
                 threshold=thr, threshold_source=threshold_source,
+                threshold_unit=threshold_unit,
                 postprocess=pp, postprocess_source=pp_source,
                 fmax_plot=args.fmax_plot, clip_context=args.clip_context,
             )
@@ -520,7 +674,52 @@ def cmd_review_import(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------ normal learning
+def cmd_train_normal(args) -> int:
+    from .normal_fit import fit_normal
+    cfg = NormalConfig(enter_s=args.enter_s, release_s=args.normal_release_s,
+                       min_duration=args.min_dur, merge_gap=args.merge_gap)
+    detector, report = fit_normal(
+        args.audio_dir, args.labels, args.out, pairing=args.pairing,
+        fully_reviewed=args.fully_reviewed_normal, normal=cfg, alpha=args.alpha,
+        calibration_fraction=args.calibration_fraction, test_fraction=args.test_fraction)
+    out = Path(args.out)
+    _write_json(out / "model.json", detector.to_dict())
+    _write_json(out / "training_report.json", report)
+    print(f"正常模型已保存 -> {out / 'model.json'}")
+    print("只使用训练/校准集的正常区间；留出检查未用于拟合或选择阈值。")
+    for group, metrics in report["metrics"].items():
+        tm = metrics["time_metrics"]
+        print(f"  {group}: 时长准确率={metrics['time_accuracy']} "
+              f"异常时长召回={tm['recall']} 精确率={tm['precision']}")
+    return 0
+
+
 # -------------------------------------------------------------------- probe
+def cmd_fit(args) -> int:
+    from .fit import fit
+    base = load_detector(args.config) if args.config else StabilityDetector()
+    if not isinstance(base, StabilityDetector):
+        raise ValueError("l1-fit 只适用于 spectral_stability_v3 配置")
+    detector, report = fit(args.audio_dir, args.labels, base=base,
+                           val_fraction=args.val_fraction, alpha=args.alpha,
+                           alpha_stable=args.alpha_stable)
+    payload = detector.to_dict()
+    payload["fit"] = report.to_dict()
+    out = _write_json(args.out, payload)
+    if args.report:
+        _write_json(args.report, report.to_dict())
+    v = report.validation
+    print(f"拟合完成 -> {out}")
+    print(f"  样本: 拟合 {len(report.files['fit'])} 条 / 验证 {len(report.files['validation'])} 条")
+    print(f"  阈值: " + ", ".join(f"{k}={v:.3g}" for k, v in report.best["thresholds"].items()))
+    print(f"  验证集: 时长 F1={v['time_f1']} acc={v['time_accuracy']} "
+          f"R={v['time_recall']} P={v['time_precision']} 覆盖={v['coverage']} | "
+          f"事件 F1={v['event_f1']} 预测 {v['n_pred']} 个")
+    print(f"  拟合集(样本内): 事件 F1={report.train['event_f1']} 时长准确率={report.train['time_accuracy']}")
+    return 0
+
+
 def cmd_probe(args) -> int:
     path = Path(args.input)
     try:
@@ -551,8 +750,8 @@ def cmd_probe(args) -> int:
 
 # ------------------------------------------------------------------- parser
 def _add_detector_args(p):
-    p.add_argument("--config", help="可选 L1 JSON 配置；不传则使用内置默认值，无需训练")
-    p.add_argument("--threshold", type=float, help="频谱变化阈值，默认 6 dB")
+    p.add_argument("--config", help="L1 JSON 配置或正常样本 model.json；不传仍使用 spectral_stability_v3")
+    p.add_argument("--threshold", type=float, help="旧版的变化 dB 阈值 / 正常模型的偏离倍数（默认加载模型阈值）")
     p.add_argument("--min-dur", type=float, help="跟踪事件最短时长，默认 0.06 秒")
     p.add_argument("--merge-gap", type=float, help="相邻完整事件合并间隔，默认 0.35 秒")
     p.add_argument("--low-ratio", type=float, help="边缘种子退出/进入比值，非完整事件结束阈值，默认 0.6")
@@ -564,6 +763,36 @@ def _add_detector_args(p):
     p.add_argument("--stability-db", type=float, help="新工况的谱形/能量稳定容差，默认 1.5 dB")
     p.add_argument("--min-prominence", type=float, help="事件与背景的能量差异比例下限，默认 0.3；越大过滤越强")
     p.add_argument("--relative-floor-db", type=float, help="比录音强声参考低多少 dB 仍保留，默认 15；越小过滤越强")
+    # --- spectral_stability_v3 -------------------------------------------------
+    p.add_argument("--trigger-change-z", type=float,
+                   help="变化强度触发阈值，单位=局部噪声σ，默认 3.0；越大越不敏感")
+    p.add_argument("--trigger-exceed", type=float,
+                   help="触发所需的最小超容差频带比例（0–1），默认 0.15")
+    p.add_argument("--trigger-frames", type=int, help="快速变化需连续帧数，默认 3")
+    p.add_argument("--slow-ratio-trigger", type=float, help="慢变化触发阈值（容差倍数），默认 2.5")
+    p.add_argument("--slow-frames", type=int, help="慢变化需连续帧数，默认 10")
+    p.add_argument("--confirm-s", type=float, help="结束事件所需的稳定确认时长，默认 0.8 秒")
+    p.add_argument("--stable-s", type=float, help="判断稳定的观察窗，默认 0.6 秒")
+    p.add_argument("--noise-s", type=float, help="局部噪声尺度的估计窗，默认 2 秒")
+    p.add_argument("--band-z", type=float, help="单频带超容差阈值（噪声σ），默认 3")
+    p.add_argument("--fast-s", type=float, help="快速变化比较跨度，默认 0.1 秒")
+    p.add_argument("--drift-s", type=float, help="局部均值漂移比较半步长，默认 0.4 秒")
+    p.add_argument("--sigma-floor-db", type=float, help="噪声尺度下限，默认 0.35 dB")
+    p.add_argument("--sigma-cap-db", type=float, help="噪声尺度上限，默认 6 dB")
+    p.add_argument("--fluct-scale", type=float, help="允许波动 = 该倍数 x 局部σ，默认 1.2")
+    p.add_argument("--drift-scale", type=float, help="允许漂移 = 该倍数 x 局部σ，默认 1.2")
+    p.add_argument("--stable-band-frac", type=float, help="稳定所需频带比例，默认 0.75")
+    p.add_argument("--active-range-db", type=float, help="比最强频带低多少 dB 以内才参与判定，默认 30")
+    p.add_argument("--slow-min-duration", type=float,
+                   help="仅由慢变化触发的事件最短时长，默认 0.5 秒")
+    p.add_argument("--weight-exp", type=float,
+                   help="频带权重指数（0=按频带计数），默认 0.25")
+    p.add_argument("--slow-scale", type=float,
+                   help="慢变化容差 = 该倍数 x 该频带自身慢波动，默认 2.0")
+    p.add_argument("--excess-scale", type=float,
+                   help="电平偏离容差 = 该倍数 x 残差自身波动，默认 3.0")
+    p.add_argument("--init-s", type=float, help="开头用于建立噪声基准的时长，默认 0.5 秒")
+    p.add_argument("--backdate-s", type=float, help="触发后向前回溯起点上限，默认 0.6 秒")
     for name in ("sr", "n-fft", "hop", "n-mels"):
         p.add_argument("--" + name, type=int)
     for name in ("fmin", "fmax", "target-step", "compare-s", "smooth-s", "dynamic-range-db"):
@@ -578,6 +807,33 @@ def _add_data_args(p: argparse.ArgumentParser, required: bool = True) -> None:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="wind_audio", description="风机音频两级检测与人工审核增量学习")
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    normal = sub.add_parser("l1-train-normal", help="只从标注正常片段学习波动容差，输出可复用的正常模型")
+    normal.add_argument("--audio-dir", required=True)
+    normal.add_argument("--labels", required=True, help="正常区间标注目录，名称为 正常/normal（可带编号）")
+    normal.add_argument("--out", required=True, help="新的训练输出目录，保存模型/报告/配对表")
+    normal.add_argument("--pairing", choices=["stem", "sorted"], default="stem")
+    normal.add_argument("--fully-reviewed-normal", action="store_true", help="确认所有正常区间均已标出，其余为异常")
+    normal.add_argument("--alpha", type=float, default=0.01, help="正常校准帧的经验尾部比例，不是事件误报率保证")
+    normal.add_argument("--calibration-fraction", type=float, default=0.2)
+    normal.add_argument("--test-fraction", type=float, default=0.2)
+    normal.add_argument("--enter-s", type=float, default=0.16, help="普通偏离需连续保持的秒数")
+    normal.add_argument("--normal-release-s", type=float, default=0.6, help="正常恢复确认秒数，输出终点回退到恢复起点")
+    normal.add_argument("--min-dur", type=float, default=0.2, help="普通偏离最短时长；强短事件保留")
+    normal.add_argument("--merge-gap", type=float, default=0.35)
+    normal.set_defaults(func=cmd_train_normal)
+
+    f = sub.add_parser("l1-fit", help="用平稳区域标注重新标定 L1 v3 阈值并选出结构参数")
+    f.add_argument("--audio-dir", required=True)
+    f.add_argument("--labels", required=True, help="平稳区域标注目录（Name/Start/Duration）")
+    f.add_argument("--config", help="结构参数模板，默认使用内置 v3 默认值")
+    f.add_argument("--out", required=True, help="输出的 L1 配置文件")
+    f.add_argument("--report", help="可选：拟合报告 JSON")
+    f.add_argument("--val-fraction", type=float, default=0.3, help="按时间顺序留出的验证比例，默认 0.3")
+    f.add_argument("--alpha", type=float, default=1e-3, help="平稳帧上的目标误触发率，默认 1e-3")
+    f.add_argument("--alpha-stable", type=float, default=1e-2,
+                   help="平稳帧被误判为不稳定的目标比例，默认 1e-2")
+    f.set_defaults(func=cmd_fit)
 
     q = sub.add_parser("probe")
     q.add_argument("--input", required=True)
@@ -621,6 +877,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="标注目录配对：同名 stem；用户确认编号与音频排序一致才选 sorted")
     ev.add_argument("--assume-unlabeled-normal", action="store_true",
                     help="声明所有音频已完整审核，未标注部分及空标注均为正常")
+    ev.add_argument("--labels-are-stable", action="store_true",
+                    help="标注标的是平稳区间：区间内为正常，录音内其余时间按异常评估")
     _add_detector_args(ev)
     ev.add_argument("--splits", help="可选固定划分；不传则评估整个清单")
     ev.add_argument("--split", choices=["val", "test"], default="test")

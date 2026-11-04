@@ -103,7 +103,7 @@ class WindowTests(unittest.TestCase):
     def test_threshold_and_no_model_input(self):
         det, bundle, _ = detect(wave())
         self.assertEqual(det.predict_events(bundle, threshold=1000), [])
-        self.assertEqual(load_detector().detector_type, "spectral_change")
+        self.assertEqual(load_detector().detector_type, "spectral_stability")
         for threshold in (0, -1, float("nan")):
             with self.assertRaises(ValueError):
                 SpectralChangeDetector(threshold=threshold)

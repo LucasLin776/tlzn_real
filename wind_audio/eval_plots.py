@@ -177,13 +177,21 @@ class ComparisonReport:
         axes[0].set_ylabel("幅值", fontproperties=fp, fontsize=9)
         axes[0].grid(axis="x", color="#e0e5eb", linewidth=.6)
 
-        axes[1].plot(bundle.times, traces["change_db"], color="#283d52", lw=.85, label="频谱变化")
-        axes[1].plot(bundle.times, traces["activity_db"], color="#159987", lw=.8, label="持续活动")
-        axes[1].axhline(detector.threshold, color=RED, ls="--", lw=.8, label=f"进入阈值 {detector.threshold:g}")
-        axes[1].axhline(detector.postprocess["release_db"], color=ORANGE, ls=":", lw=.9,
-                       label=f"活动释放 {detector.postprocess['release_db']:g}")
-        axes[1].set_title("L1 实际检测分数（dB，不是概率）", loc="left", fontproperties=fp, fontsize=10)
-        axes[1].set_ylabel("分数 / dB", fontproperties=fp, fontsize=9)
+        curves = traces.get("curves") or []
+        primary = curves[0] if curves else None
+        if primary is None:
+            raise ValueError("检测器没有提供可绘制的诊断曲线")
+        same_unit = [c for c in curves if c.get("unit") == primary.get("unit")]
+        line_colors = ["#283d52", "#159987", "#7a5cc0"]
+        dash = ["--", ":", "-."]
+        for i, curve in enumerate(same_unit):
+            axes[1].plot(bundle.times, curve["values"], color=line_colors[i % 3], lw=.85, label=curve["label"])
+            axes[1].axhline(curve["threshold"], color=[RED, ORANGE, BLUE][i % 3], ls=dash[i % 3], lw=.85,
+                            label=f"{curve['label']}阈值 {curve['threshold']:g}")
+        axes[1].set_title(primary["title"], loc="left", fontproperties=fp, fontsize=10)
+        unit_label = {"dB": "分数 / dB", "noise": "变化 / 噪声σ", "ratio": "比例 (0–1)"}.get(
+            primary.get("unit"), primary.get("unit", ""))
+        axes[1].set_ylabel(unit_label, fontproperties=fp, fontsize=9)
         axes[1].set_ylim(bottom=0)
         small_font = fp.copy()
         small_font.set_size(7)

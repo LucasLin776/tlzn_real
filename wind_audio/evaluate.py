@@ -29,10 +29,40 @@ from .data import (
     resolve_audio_path,
 )
 from .features import FeatureConfig, extract_features
+from .stability import audio_quality
+
+
+# Fixed before validation and applied identically to labels and predictions.
+CLUSTER_GAP_S = 0.5      # shorter than the stability confirmation time
+TAIL_WINDOW_S = 3.0      # window after a labelled event used for trailing alarms
+TAIL_COUNT_S = 0.5       # a tail longer than this counts as a trailing alarm
 
 
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:
     return max(0.0, min(a1, b1) - max(a0, b0))
+
+
+def cluster_events(events: list[dict], gap: float = CLUSTER_GAP_S) -> list[dict]:
+    """Merge intervals separated by <= gap.  Same rule for truth and predictions."""
+    merged: list[list[float]] = []
+    for event in sorted(events, key=lambda e: e["start_s"]):
+        a, b = float(event["start_s"]), float(event["end_s"])
+        if merged and a - merged[-1][1] <= gap + 1e-9:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return [{"start_s": a, "end_s": b} for a, b in merged]
+
+
+def merge_intervals(events: list[dict]) -> list[list[float]]:
+    merged: list[list[float]] = []
+    for event in sorted(events, key=lambda e: e["start_s"]):
+        a, b = max(0.0, float(event["start_s"])), float(event["end_s"])
+        if merged and a <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], b)
+        else:
+            merged.append([a, b])
+    return merged
 
 
 def iou(a: dict, b: dict) -> float:
@@ -164,6 +194,26 @@ def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1):
     tp_s = max(0.0, min(anomaly_s, alarm_s - normal_alarm))
     fp_s = max(0.0, min(normal_s, normal_alarm))
     time = binary_metrics(tp_s, max(0.0, normal_s - fp_s), fp_s, max(0.0, anomaly_s - tp_s))
+    # Trailing alarm: how long the prediction keeps alarming *after* each
+    # labelled event ends.  Counted only where the audio was reviewed as normal.
+    normal_regions = [r for r in regions if r["label"] == "normal"]
+    merged_pred = merge_intervals(reviewed)
+    trailing_s, n_trailing = 0.0, 0
+    for g in gt:
+        lo = float(g["end_s"])
+        hi = min(float(record.duration_s), lo + TAIL_WINDOW_S)
+        tail = 0.0
+        for a, b in merged_pred:
+            for r in normal_regions:
+                lo2, hi2 = max(lo, a, r["start_s"]), min(hi, b, r["end_s"])
+                if hi2 > lo2:
+                    tail += hi2 - lo2
+        trailing_s += tail
+        n_trailing += int(tail > TAIL_COUNT_S)
+    gt_clusters = cluster_events(gt)
+    pred_clusters = cluster_events([{"start_s": p["start_s"], "end_s": p["end_s"]} for p in reviewed])
+    cluster_match = match_events(pred_clusters, gt_clusters, iou_threshold)
+
     truth = _file_label(record, anns, regions)
     predicted = "anomaly" if pred_events else "normal"
     outcome = ("excluded" if truth is None else
@@ -183,6 +233,9 @@ def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1):
         "gt_duration_s": sum(g["end_s"] - g["start_s"] for g in gt),
         "boundary_start_errors_s": [abs(reviewed[i]["start_s"] - gt[j]["start_s"]) for i, j in matches],
         "boundary_end_errors_s": [abs(reviewed[i]["end_s"] - gt[j]["end_s"]) for i, j in matches],
+        "trailing_alarm_s": trailing_s, "n_trailing": n_trailing,
+        "n_gt_clusters": len(gt_clusters), "n_pred_clusters": len(pred_clusters),
+        "n_matched_clusters": len(cluster_match["matches"]),
         "file_true_label": truth, "file_predicted_label": predicted, "file_outcome": outcome,
         "time_metrics": time, "time_accuracy": time["accuracy"],
         "predicted_events": pred_events, "ground_truth_events": gt, "matches": match_details,
@@ -195,7 +248,7 @@ def _median(values: list[float]) -> float | None:
     return float(np.median(values)) if values else None
 
 
-def aggregate_file_metrics(rows: list[dict]) -> dict:
+def aggregate_file_metrics(rows: list[dict], *, with_groups: bool = True) -> dict:
     normal_s = sum(r["normal_s"] for r in rows)
     anomaly_s = sum(r["anomaly_s"] for r in rows)
     unknown_s = sum(r["unknown_s"] for r in rows)
@@ -217,7 +270,13 @@ def aggregate_file_metrics(rows: list[dict]) -> dict:
     file_metrics = binary_metrics(*(sum(r["file_outcome"] == k for r in rows) for k in ("TP", "TN", "FP", "FN")))
     file_metrics["excluded"] = sum(r["file_outcome"] == "excluded" for r in rows)
     time_metrics = binary_metrics(*(sum(r["time_metrics"][k] for r in rows) for k in ("tp", "tn", "fp", "fn")))
-    return {
+    n_gt_clusters = sum(r["n_gt_clusters"] for r in rows)
+    n_pred_clusters = sum(r["n_pred_clusters"] for r in rows)
+    n_matched_clusters = sum(r["n_matched_clusters"] for r in rows)
+    trailing_s = sum(r["trailing_alarm_s"] for r in rows)
+    n_trailing = sum(r["n_trailing"] for r in rows)
+    gt_reviewed_total = sum(r["n_gt_events"] for r in rows)
+    result = {
         "file_accuracy": file_metrics["accuracy"], "file_metrics": file_metrics,
         "time_accuracy": time_metrics["accuracy"], "time_metrics": time_metrics,
         "files": len(rows),
@@ -243,7 +302,45 @@ def aggregate_file_metrics(rows: list[dict]) -> dict:
         "boundary_end_median_s": _median(end_err),
         "excluded_unknown_events": sum(r["excluded_unknown_events"] for r in rows),
         "normal_hours": round(normal_hours, 4),
+        "event_cluster_gap_s": CLUSTER_GAP_S,
+        "n_gt_clusters": n_gt_clusters,
+        "n_pred_clusters": n_pred_clusters,
+        "n_matched_clusters": n_matched_clusters,
+        "cluster_recall": (n_matched_clusters / n_gt_clusters) if n_gt_clusters else None,
+        "cluster_precision": (n_matched_clusters / n_pred_clusters) if n_pred_clusters else None,
+        "cluster_f1": (2 * n_matched_clusters / (n_gt_clusters + n_pred_clusters))
+        if n_gt_clusters + n_pred_clusters else None,
+        "trailing_alarm_s": round(trailing_s, 3),
+        "trailing_alarm_per_event_s": round(trailing_s / gt_reviewed_total, 3) if gt_reviewed_total else None,
+        "n_trailing": n_trailing,
+        "trailing_alarm_ratio": (n_trailing / gt_reviewed_total) if gt_reviewed_total else None,
+        "tail_window_s": TAIL_WINDOW_S,
+        "tail_count_s": TAIL_COUNT_S,
     }
+    if with_groups:
+        groups = _quality_groups(rows)
+        if groups:
+            result["quality_groups"] = groups
+    return result
+
+
+def _quality_groups(rows: list[dict]) -> dict:
+    """Report clipped and clean recordings separately; never mix them silently."""
+    if not rows or "clip_ratio" not in rows[0]:
+        return {}
+    out = {}
+    for name, predicate in (("clean", lambda r: r["clip_ratio"] < 0.001),
+                            ("clipped", lambda r: r["clip_ratio"] >= 0.001)):
+        subset = [r for r in rows if predicate(r)]
+        if not subset:
+            continue
+        agg = aggregate_file_metrics(subset, with_groups=False)
+        out[name] = {"files": len(subset),
+                     "clip_ratio_median": float(np.median([r["clip_ratio"] for r in subset])),
+                     "event_recall": agg["event_recall"], "event_precision": agg["event_precision"],
+                     "time_accuracy": agg["time_accuracy"],
+                     "coverage": agg["coverage"], "n_gt_events": agg["n_gt_events"]}
+    return out
 
 
 def evaluate_detector(
@@ -280,10 +377,23 @@ def evaluate_detector(
         row["audio_path"] = str(resolve_audio_path(rec, manifest_path))
         if on_file is not None:
             on_file(rec, anns, x, sr, bundle, traces, row, detector, index, len(audio_ids))
+        quality = audio_quality(x, sr)
+        row["clip_ratio"] = quality["clip_ratio"]
+        row["crest_db"] = quality["crest_db"]
+        row["rms_dbfs"] = quality["rms_dbfs"]
         rows.append(row)
     overall = aggregate_file_metrics(rows)
-    overall["threshold"] = float(detector.threshold if threshold is None else threshold)
-    overall["postprocess"] = dict(detector.postprocess if postprocess is None else postprocess)
+    if detector.detector_type == "normal_envelope":
+        overall["threshold"] = float(detector.threshold if threshold is None else threshold)
+        overall["normal_config"] = detector.normal.to_dict()
+    elif hasattr(detector, "threshold"):          # legacy spectral_event_v2
+        overall["threshold"] = float(detector.threshold if threshold is None else threshold)
+        overall["postprocess"] = dict(detector.postprocess if postprocess is None else postprocess)
+    else:                                        # spectral_stability_v3
+        overall["trigger_change_z"] = float(detector.events.trigger_change_z
+                                           if threshold is None else threshold)
+        overall["event_config"] = dict(detector.events.to_dict() if postprocess is None else postprocess)
+        overall["stability_config"] = dict(detector.stability.to_dict())
     overall["iou_threshold"] = iou_threshold
     overall["per_file"] = rows
     return overall

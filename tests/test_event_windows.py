@@ -21,10 +21,13 @@ def run(x, **postprocess):
 
 class EventWindowTests(unittest.TestCase):
     def test_config_and_cli_controls_match(self):
-        from wind_audio.detectors import load_detector
-        self.assertEqual(load_detector(Path(__file__).parents[1] / "config/l1.json").to_dict(),
-                         SpectralChangeDetector().to_dict())
-        args = cli.build_parser().parse_args(["run", "--input", "unused", "--relative-floor-db", "12",
+        """Legacy v2 config and its CLI flags still round-trip exactly."""
+        from wind_audio.detectors import StabilityDetector, load_detector
+        legacy = Path(__file__).parents[1] / "config/l1.json"
+        v3 = Path(__file__).parents[1] / "config/l1_v3.json"
+        self.assertEqual(load_detector(legacy).to_dict(), SpectralChangeDetector().to_dict())
+        args = cli.build_parser().parse_args(["run", "--input", "unused", "--config", str(legacy),
+                                             "--relative-floor-db", "12",
                                              "--min-prominence", ".4", "--quiet-s", ".4"])
         detector = cli._detector_from_args(args)
         self.assertEqual(detector.postprocess["relative_floor_db"], 12)
@@ -33,6 +36,17 @@ class EventWindowTests(unittest.TestCase):
         for pp in ({"quiet_s": 0}, {"release_db": float("nan")}, {"min_prominence": 1}, {"typo": 3}):
             with self.assertRaises(ValueError):
                 SpectralChangeDetector(postprocess=pp)
+        # v3 config round-trips and rejects legacy-only flags instead of
+        # silently reinterpreting them.
+        loaded = load_detector(v3)
+        self.assertIsInstance(loaded, StabilityDetector)
+        self.assertEqual(load_detector(v3).to_dict(), loaded.to_dict())
+        with self.assertRaises(ValueError):
+            cli._detector_from_args(cli.build_parser().parse_args(
+                ["run", "--input", "unused", "--release-db", "3"]))
+        with self.assertRaises(ValueError):
+            cli._detector_from_args(cli.build_parser().parse_args(
+                ["run", "--input", "unused", "--config", str(legacy), "--trigger-change-z", "3"]))
 
     def test_batch_report_and_long_names_keep_unique_window_files(self):
         with tempfile.TemporaryDirectory() as td, contextlib.redirect_stdout(io.StringIO()):
@@ -56,7 +70,9 @@ class EventWindowTests(unittest.TestCase):
                 names = [e["window"]["path"] for e in payload["events"]]
                 self.assertEqual(len(names), len(set(names)))
                 self.assertTrue(all((folder / n).exists() for n in names))
-                self.assertTrue((folder / "activity.png").exists())
+                for image in ("waveform.png", "spectrogram.png", "change_z.png"):
+                    self.assertTrue((folder / image).exists(), image)
+                self.assertTrue((folder / "exceed.png").exists())
                 self.assertIn("event_active", (folder / "scores.csv").read_text().splitlines()[0])
                 self.assertIn("rejected_candidates", payload["diagnostics"])
 

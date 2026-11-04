@@ -1,2 +1,2 @@
-"""Training-free L1 spectral windows + reviewed PANNs continual learning."""
-__version__ = "0.7.0"
+"""Normal-only audio anomaly learning and reviewed PANNs classification."""
+__version__ = "0.10.0"

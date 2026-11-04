@@ -1,14 +1,19 @@
 # Wind Audio：风机音频两级检测
 
-当前工程版本 **0.7.0**，L1 配置版本 **spectral_event_v2**。
+当前工程版本 **0.10.0**。新增 **normal_envelope_v1 正常样本学习模型**；原有
+`spectral_stability_v3`、`spectral_event_v2` 配置保留，可复现历史结果。
+不传 `--config` 仍使用旧有 v3 默认规则；使用新路线必须传训练得到的 `model.json`。
 
 | 层 | 输入与作用 | 输出 | 是否训练 |
 |---|---|---|---|
-| L1 | 原始 WAV → 比较相邻局部频谱 → 跟踪持续活动和衰减尾部 | 候选事件 `[start_s, end_s]`，只关心有没有事件及其范围 | 无需训练，使用规则和阈值 |
+| L1 正常模型 | 仅从标注正常区间学习允许的频谱时间波动，过滤轻微短噪音 | 正常区间、候选异常窗口、可试听切片 | 需要正常样本；独立正常片段校准阈值 |
+| L1 | 原始 WAV → 多尺度稳定性（快变化/慢漂移/局部噪声容差）+ 事件状态机 | 候选事件 `[start_s, end_s]`，只关心有没有事件及其范围 | 无需训练，使用规则与稳健统计量 |
 | L2 | 原始 WAV + L1 窗口 → 冻结 PANNs CNN14 特征 → 分类头 | 已知异常类型 / 疑似正常 / unknown、相似案例 | 需要人工审核数据；支持回放续训 |
 
-L1 不区分胶粒掉落、启动、异响等类型，也不直接判断故障。L2 负责类型判断，
-保留原 L1 告警；人工审核后更新分类头。L2 无法补回 L1 未提供的候选事件。
+L1 的业务前提是：**在足够长的观察时间内频谱基本稳定即正常**，不要求固定音色、频率位置或响度；
+明显超过局部噪声容差的变化才是事件，工况切换后重新稳定即结束并接受新背景。
+L1 不区分事件类型，也不直接判断故障。L2 负责类型判断，保留原 L1 告警；
+人工审核后更新分类头。L2 无法补回 L1 未提供的候选事件。
 
 ## 运行环境
 
@@ -29,16 +34,44 @@ WAV 支持 8/16/32 位整数 PCM；24 位及浮点 WAV 需先转换。多声道�
 | `l1-detect` 检测版 | `--input` 原始 WAV 文件或目录 | 实际工作：输出事件窗口、切片、可试听报告；不接收标签 |
 | `l1-test` 测试版 | `--audio-dir` 音频目录 + `--labels` 标签文件或目录 | 测试与改进：调用同一 L1，接入检验器，输出准确率、召回率、误报和逐条对比 |
 
-两个入口共享算法及 `config/l1.json`。标签仅在测试版中参与结果比较，不进入检测算法。
+两个入口共享算法及 `config/l1_v3.json`。标签仅在测试版中参与结果比较，不进入检测算法。
 旧命令 `run`、`evaluate` 分别作为两者的别名保留；`run` 也不再接受标签输入。
 实际检测仍是离线 WAV 分析，不是实时流式服务。
+
+### 新路线：只学习正常片段（B05）
+
+用户已确认 B05 标注覆盖全部正常片段、编号与音频时间顺序对应；B02–B04 的旧异常标注不能混入。
+
+```bash
+python -m wind_audio l1-train-normal \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
+  --labels /Users/shuoqinlin/Desktop/数据/B05/标注 \
+  --pairing sorted --fully-reviewed-normal \
+  --out runs/normal_b05_new
+
+python -m wind_audio l1-detect \
+  --input /Users/shuoqinlin/Desktop/数据/B05/音频 \
+  --config runs/normal_b05_final/model.json \
+  --out runs/normal_b05_new_detection
+```
+
+本次已训练的模型位于 `runs/normal_b05_final/model.json`，训练记录及留出检查指标位于同目录
+`training_report.json`。训练输出目录必须是新的；第一条命令会产生自己的 `model.json`。
+正常模型学习的是**允许多大时间波动**，不是固定音色；轻微短偏离先过滤，强短事件仍保留，
+相邻异常可以合并，新工况稳定后结束报警。正常片段边界留出完整上下文，防止邻接异常污染训练。
+
+96 条文件按时间切为 **58 训练 / 19 校准 / 19 留出检查**，只有前两组的正常内部帧用于学习。
+本次留出检查：按时长计，精确率 **90.7%**、召回率 **44.3%**、准确率 **74.1%**，
+正常时长中 **3.4%** 被误报。当前是偏保守基线，仍有明显漏检，不能称为检测完备。
+本会话留出并非跨会话泛化证明，且 B05 曾被历史版本开发使用；不是全项目盲测。
+详见 [正常样本学习说明](docs/NORMAL_MODEL.md)。
 
 ### 检测版：仅指定原始音频
 
 ```bash
 python -m wind_audio l1-detect \
   --input /Users/shuoqinlin/Desktop/数据/B02/音频 \
-  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
+  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1_v3.json \
   --out /Users/shuoqinlin/Desktop/wind_audio/runs/l1_detect_B02
 ```
 
@@ -53,8 +86,8 @@ python -m wind_audio l1-test \
   --audio-dir /Users/shuoqinlin/Desktop/数据/B02/音频 \
   --labels /Users/shuoqinlin/Desktop/数据/B02/标注 \
   --pairing sorted --assume-unlabeled-normal \
-  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1.json \
-  --out /Users/shuoqinlin/Desktop/输出结果/B02_visual_new
+  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1_v3.json \
+  --out /Users/shuoqinlin/Desktop/输出结果/B02_visual_v3
 ```
 
 本数据集已确认：B02-001～100 对应音频按时间排序；所有音频完整审核；
@@ -75,19 +108,23 @@ python -m wind_audio l1-test \
 未审核区域用灰底表示；没有精确区间标签时会明确提示，不把整段粗标签画成异常区间。
 可用 `--no-plots` 只输出数值结果；中文字体默认使用系统字体，缺少时用 `--plot-font /path/to/font.ttf` 指定。
 
-现有默认配置的 B02 结果在 [评估简报](reports/l1_B02/brief.md)：
+三批开发数据的新旧对比（完整命令与说明见 [L1 v3 设计与结果](docs/L1_V3.md)）：
 
-| 指标 | 结果 |
-|---|---:|
-| 文件级准确率 | 96.00%（11 TP、85 TN、4 FP、0 FN） |
-| 文件级召回率 / 精确率 | 100.00% / 73.33% |
-| 按时长准确率 | 97.71% |
-| 异常时长召回率 / 时长精确率 | 79.18% / 30.90% |
-| 事件召回率 / 精确率 | 66.67% / 60.61%（IoU ≥ 0.1，一对一匹配） |
+| 批次 | 版本 | 事件召回 | 事件精确率 | 事件 F1 | 时长准确率 | 时长精确率 | 覆盖率 | 报警拖尾 s | 最长窗口 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| B02 | v2 | 0.667 | 0.606 | 0.635 | 0.977 | 0.309 | 0.530 | 22.9 | 21.4 s |
+| B02 | **v3** | **0.733** | 0.333 | 0.458 | **0.982** | **0.364** | **0.624** | **12.9** | **6.2 s** |
+| B03 | v2 | 0.863 | 0.942 | 0.901 | 0.857 | 0.552 | 0.596 | 282.0 | 17.4 s |
+| B03 | **v3** | **0.951** | **0.946** | **0.948** | **0.868** | **0.670** | 0.354 | **96.7** | **2.5 s** |
+| B04 | v2 | 0.531 | 0.938 | 0.678 | 0.921 | 0.702 | 0.367 | 48.8 | 20.1 s |
+| B04 | **v3** | **0.675** | 0.860 | **0.757** | 0.921 | **0.737** | 0.333 | **40.7** | **4.3 s** |
 
-文件级全检出仅表示 11 条带标记录音均出现过告警；30 个事件中只有 20 个匹配成功。
-正常时长占比很高，需结合异常召回率、误报时长与 F1 判断效果。
-这是一批同一设备录音上的结果，不代表跨设备泛化性能；本次未调参。
+事件召回三批均上升；最长窗口从 20 s 级降到 2–6 s，“工况改变后一直报警到文件末尾”的问题基本消失；
+报警拖尾大幅下降；B03/B04 的事件 F1 与时长精确率上升；B02 的时长口径全部优于旧版。
+**B02 的事件精确率仍低于旧版**（0.606→0.333）：新版会多报约 45 个短事件（2–16 kHz 对比 +2~4 dB 的弱瞬态，
+以及 20–300 Hz 的低频起伏），旧版靠“整条录音最强声”过滤压掉了它们，新业务定义不再使用这种过滤。
+B03 覆盖率下降属于标注口径冲突：标注比实测声学核心前后各宽约 0.2 s（详见文档第 5 节）。
+三批均用于开发与对照，**不代表独立测试集上的泛化性能**。
 
 [检验器实现步骤、标签格式与指标定义](docs/L1_EVALUATION.md) · [完整标注规范](docs/ANNOTATION.md)
 
@@ -96,18 +133,18 @@ python -m wind_audio l1-test \
 ```bash
 python -m wind_audio l1-test \
   --audio-dir /path/to/audio --labels /path/to/labels.csv \
-  --config config/l1.json --out reports/l1_check
+  --config config/l1_v3.json --out reports/l1_check
 
 python -m wind_audio l1-test \
   --manifest /path/to/manifest.csv --annotations /path/to/annotations.csv \
-  --config config/l1.json --out reports/l1_check_manifest
+  --config config/l1_v3.json --out reports/l1_check_manifest
 ```
 
 ## L1 检测与审核
 
 ```bash
 python -m wind_audio l1-detect --input /path/to/audio \
-  --config config/l1.json --out runs/l1_latest
+  --config config/l1_v3.json --out runs/l1_latest
 ```
 
 `--input` 支持单条 WAV 或目录；目录输入生成总览和逐文件报告。
@@ -116,22 +153,26 @@ python -m wind_audio l1-detect --input /path/to/audio \
 `trigger_start_s/end_s` 是变化种子，L2 和标签比较使用完整窗口的 `start_s/end_s`。
 `right_censored=true` 表示录音结束时尚未确认事件结束。
 
-L1 默认 44.1 kHz、2048 点 FFT、64 Mel、20 ms 输出步长，比较前后各 0.1 秒频谱，
-计算能量加权的 dB 变化。变化触发后冻结前 0.6 秒背景，持续跟踪正向谱差；
-背景恢复或新工况稳定时结束窗口，过滤弱候选、合并短间隔并补边界。
+L1 默认 44.1 kHz、2048 点 FFT、64 Mel、20 ms 输出步长，在**多个时间尺度**上判断稳定性：
+0.1 s 快速变化、1 s 慢漂移、2 s 局部噪声尺度、0.6 s 稳定观察窗。
+每个频带用自身波动与局部噪声比较，不再使用固定 dB 门槛，也不与整条录音的最强声比较。
 
 | 参数 | 默认 | 作用 |
 |---|---:|---|
-| `--threshold` | 6 dB | 变化进入阈值，越高越不敏感 |
-| `--release-db` | 3 dB | 持续活动释放阈值，越低尾部越长 |
-| `--quiet-s` / `--settle-s` | 0.25 / 0.6 秒 | 背景恢复 / 新工况稳定确认时间 |
-| `--min-prominence` | 0.3 | 与局部背景的差异比例下限 |
-| `--relative-floor-db` | 15 dB | 相对整条录音强声参考的筛选范围 |
-| `--merge-gap` / `--padding` | 0.35 / 0.05 秒 | 窗口合并间隔 / 每侧边界补充 |
+| `--trigger-change-z` | 3.0 | 触发所需变化强度（局部噪声 σ，不是 dB） |
+| `--trigger-exceed` | 0.15 | 触发所需的超容差频带比例 |
+| `--band-z` / `--sigma-floor-db` / `--sigma-cap-db` | 3 / 0.35 / 6 dB | 单频带门槛与噪声尺度上下限 |
+| `--noise-s` / `--stable-s` / `--fast-s` | 2 / 0.6 / 0.1 秒 | 噪声、稳定、快变化的观察尺度 |
+| `--confirm-s` / `--hold-s` | 0.8 / 0.2 秒 | 结束事件所需的稳定确认与“无触发”保持时间 |
+| `--slow-min-duration` | 0.5 秒 | 仅由慢变化触发的事件最短时长，防止块边界伪事件 |
+| `--min-dur` / `--padding` | 0.06 / 0 秒 | 最短事件 / 边界补充（默认不扩张） |
 
-完整参数见 `python -m wind_audio l1-detect --help` 和 `config/l1.json`。
-分数不是概率；稳定异音、缓慢变化、短促弱事件和录音边缘可能漏检，工况切换可能误报。
-全文件离线分析使用未来上下文，不是流式服务；20 ms 网格不等于真实边界精度。
+完整参数与调节方向见 `python -m wind_audio l1-detect --help`、`config/l1_v3.json`
+和 [L1 v3 文档](docs/L1_V3.md)。`change_z` 的单位是局部噪声 σ，**不是 dB、不是概率**；
+`exceed` 与 `stable_frac` 是 0–1 的比例。报告与图表使用相同阈值，不再标注为 dB。
+旧版配置 `config/l1.json` 仍可用，旧参数（`--threshold`、`--release-db` 等）只能配旧配置，
+与新配置混用会直接报错而不是静默解释。
+全文件离线分析不是流式服务；20 ms 网格不等于真实边界精度；削顶录音只做质量诊断，不修改波形。
 
 人工填写 `l1_label`、修订边界及 `positive_types/negative_types` 后导入：
 
@@ -141,6 +182,29 @@ python -m wind_audio review-import \
 ```
 
 预测不能直接当人工真值；未审核部分不默认正常。还需抽查无告警录音以发现漏检。
+
+## 平稳区域拟合（B05 口径）
+
+如果标注标的是**平稳区间**而不是异常事件，用 `--labels-are-stable` 评估，
+用 `l1-fit` 在该批数据上重新标定阈值并选择分段方式：
+
+```bash
+python -m wind_audio l1-test \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
+  --labels    /Users/shuoqinlin/Desktop/数据/B05/标注 \
+  --pairing sorted --labels-are-stable \
+  --config config/l1_v3.json --no-plots --out runs/l1_v3/b05_base
+
+python -m wind_audio l1-fit \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
+  --labels    /Users/shuoqinlin/Desktop/数据/B05/标注 \
+  --out config/l1_fit_b05.json --report runs/l1_v3/fit_b05/report.json
+```
+
+`l1-fit` 在平稳帧上估计每个判据的分布，把阈值放到其尾部（`--alpha`、`--alpha-stable` 控制目标误判率），
+再按时间顺序留出尾部做验证，最后选择 `segment_mode`/`confirm_s` 等结构项。
+B05 结果：验证集时长 F1 0.419 → **0.688**、覆盖率 0.158 → **0.473**。
+详见 [平稳区域拟合](docs/L1_FIT.md)。
 
 ## L2 训练与使用
 
@@ -175,7 +239,7 @@ python -m wind_audio l2-evaluate --model models/l2_v1 \
 
 ```bash
 python -m wind_audio pipeline --input /path/to/audio.wav \
-  --l1-config config/l1.json --l2-model models/l2_v2 \
+  --l1-config config/l1_v3.json --l2-model models/l2_v2 \
   --checkpoint weights/Cnn14_mAP=0.431.pth --device cpu --out runs/two_stage
 ```
 
@@ -183,8 +247,9 @@ python -m wind_audio pipeline --input /path/to/audio.wav \
 
 ```text
 wind_audio/
-  l1.py / features.py          局部频谱评分与特征
-  windowing.py / detectors.py  持续活动跟踪与最终窗口
+  stability.py / state.py      v3 多尺度稳定性指标与事件状态机
+  l1.py / windowing.py         旧版 v2 评分与窗口逻辑（保留复现）
+  detectors.py                 新旧检测器与配置分发
   evaluate.py / markers.py     准确率、事件指标、B02 标注导入
   eval_plots.py               逐录音四联对照图与有序 PDF
   data.py / splits.py          数据校验与来源划分

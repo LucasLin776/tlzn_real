@@ -127,7 +127,7 @@ class ImportAccuracyTests(unittest.TestCase):
             self.assertEqual(result["n_gt_events"], 1)
             self.assertEqual(result["n_matched"], 1)
             self.assertEqual(result["unknown_s"], 0)
-            self.assertEqual(result["detector_config"]["version"], "spectral_event_v2")
+            self.assertEqual(result["detector_config"]["version"], "spectral_stability_v3")
             for name in ("brief.md", "per_file.csv", "events.csv", "manifest.csv", "annotations.csv", "pairing.csv"):
                 self.assertTrue((out / name).is_file(), name)
             with (out / "pairing.csv").open(encoding="utf-8-sig") as fh:
