@@ -24,9 +24,13 @@ audio_id,path,source_id,device_id,recorded_at,duration_s,sample_rate,channels,fu
 annotation_id,audio_id,start_s,end_s,label,precision,fault_type,note,reviewed_at,annotator,version
 ```
 
-label 是 normal/anomaly/uncertain。precision=interval 才提供区间真值；file 是整段粗标，不自动展开。
+label 是 normal/anomaly/uncertain。precision=interval 才提供区间真值；file 是整段粗标，
+只用于文件级准确率，不自动展开为区间真值。冲突的文件标签或 file normal 与异常区间不能并存。
 没有标签的区间为 unknown。完整审核且异常为 interval 时才可把未标注区间推为 normal；
 uncertain 始终未知。重叠冲突、倒序/越界区间和未知 audio_id 不允许。
+
+也可直接传入简易 CSV/JSON 或 B02 的 Name/Start/Duration 标注目录，
+由检验器生成标准清单；格式、配对规则和准确率口径见 [L1 检验器](L1_EVALUATION.md)。
 
 ## 审核记录（L2 训练输入）
 

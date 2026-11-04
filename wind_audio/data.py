@@ -157,8 +157,8 @@ def read_annotations(path: str | Path) -> list[Annotation]:
                 Annotation(
                     annotation_id=(row.get("annotation_id") or "").strip(),
                     audio_id=(row.get("audio_id") or "").strip(),
-                    start_s=_float(row.get("start_s")),
-                    end_s=_float(row.get("end_s")),
+                    start_s=float(row.get("start_s") or "nan"),
+                    end_s=float(row.get("end_s") or "nan"),
                     label=(row.get("label") or "uncertain").strip(),
                     precision=(row.get("precision") or "interval").strip(),
                     fault_type=(row.get("fault_type") or "").strip(),
@@ -271,7 +271,13 @@ def validate_dataset(
 
     # conflicts on overlapping interval annotations
     for audio_id in {a.audio_id for a in anns}:
-        intervals = [a for a in anns if a.audio_id == audio_id and a.precision == "interval"]
+        mine = [a for a in anns if a.audio_id == audio_id]
+        file_labels = {a.label for a in mine if a.precision == "file"}
+        if len(file_labels) > 1:
+            errors.append(f"{audio_id}: file 级标签冲突 {sorted(file_labels)}")
+        if "normal" in file_labels and any(a.label == "anomaly" for a in mine):
+            errors.append(f"{audio_id}: file 级 normal 与 anomaly 区间冲突")
+        intervals = [a for a in mine if a.precision == "interval"]
         intervals.sort(key=lambda a: a.start_s)
         for i, left in enumerate(intervals):
             for right in intervals[i + 1 :]:
@@ -406,7 +412,7 @@ def dataset_summary(
     if normal_s == 0:
         reasons.append("没有已审核正常时长，无法计算正常区误报率；不影响 L1 直接检测")
     if events == 0:
-        reasons.append("没有精确异常区间，无法计算事件召回；整段粗标仅供查看")
+        reasons.append("没有精确异常区间，无法计算事件召回；整段标签只能计算文件级准确率")
     if len(sources) < 3:
         reasons.append("独立来源不足 3 个，暂不能建立 L2 的 train/val/test 划分")
 
@@ -424,112 +430,6 @@ def dataset_summary(
     }
 
 
-def migrate_legacy_labels(
-    labels_csv: str | Path,
-    audio_dir: str | Path,
-    manifest_out: str | Path,
-    annotations_out: str | Path,
-    base_dir: str | Path | None = None,
-) -> tuple[list[AudioRecord], list[Annotation], list[str]]:
-    """Migrate the old flat labels.csv without inventing interval truth."""
-    labels_csv = Path(labels_csv)
-    audio_dir = Path(audio_dir)
-    manifest_out = Path(manifest_out)
-    annotations_out = Path(annotations_out)
-    base_dir = Path(base_dir) if base_dir else manifest_out.parent.parent
-    warnings: list[str] = []
-    records: list[AudioRecord] = []
-    anns: list[Annotation] = []
-
-    with labels_csv.open("r", encoding="utf-8-sig", newline="") as fh:
-        rows = list(csv.DictReader(fh))
-
-    seen: set[str] = set()
-    for i, row in enumerate(rows, 1):
-        fname = (row.get("file") or row.get("filename") or "").strip()
-        if not fname:
-            warnings.append(f"第 {i} 行缺少文件名，跳过")
-            continue
-        audio_path = (audio_dir / fname).resolve()
-        if not audio_path.exists():
-            warnings.append(f"找不到音频 {audio_path}，仍写入 manifest 供人工修复")
-            duration = 0.0
-            sr = 0
-            channels = 1
-        else:
-            info = wav_info(audio_path)
-            duration = info.duration_s
-            sr = info.sample_rate
-            channels = info.channels
-        audio_id = audio_path.stem
-        base_id = audio_id
-        k = 2
-        while audio_id in seen:
-            audio_id = f"{base_id}_{k}"
-            k += 1
-        seen.add(audio_id)
-        try:
-            rel = audio_path.relative_to(manifest_out.parent.resolve())
-        except ValueError:
-            rel = audio_path
-        records.append(
-            AudioRecord(
-                audio_id=audio_id,
-                path=str(rel),
-                source_id=(row.get("source_id") or base_id).strip(),
-                device_id=(row.get("device_id") or "").strip(),
-                recorded_at=(row.get("recorded_at") or "").strip(),
-                duration_s=duration,
-                sample_rate=sr,
-                channels=channels,
-                fully_reviewed=False,
-                notes="迁移自旧 labels.csv；未声明整段完整审核",
-            )
-        )
-        label = (row.get("label") or "uncertain").strip().lower()
-        if label not in LABELS:
-            label = "uncertain"
-        note = (row.get("note") or "").strip()
-        start = _float(row.get("start_s"))
-        end = _float(row.get("end_s"), duration)
-        file_level = ("无秒级" in note) or ("无区间" in note) or (abs(start) < TOL and duration > 0 and abs(end - duration) < 0.1)
-        if file_level:
-            start, end = 0.0, duration
-        anns.append(
-            Annotation(
-                annotation_id=f"legacy_{i:04d}",
-                audio_id=audio_id,
-                start_s=start,
-                end_s=end,
-                label=label,
-                precision="file" if file_level else "interval",
-                fault_type=(row.get("fault_type") or "").strip(),
-                note=note or "旧标注迁移",
-                version="legacy",
-            )
-        )
-        if not file_level and duration > 0 and end > duration + 0.05:
-            warnings.append(f"{fname}: 标注 end={end} 超出时长 {duration}")
-
-    write_manifest(records, manifest_out)
-    write_annotations(anns, annotations_out)
-    migration_note = annotations_out.parent / "MIGRATION.md"
-    migration_note.write_text(
-        "# 旧标签迁移说明\n\n"
-        f"- 原文件：`{labels_csv}`（未修改）\n"
-        f"- 新 manifest：`{manifest_out}`\n"
-        f"- 新区间标注：`{annotations_out}`\n\n"
-        "## 规则\n\n"
-        "1. 旧 `labels.csv` 中 0–30s、备注“无秒级标注”的记录迁移为 **file 级粗标**，"
-        "`fully_reviewed=false`，不生成逐帧/逐区间异常真值。\n"
-        "2. 只有明确写出的区间标注才保留为 interval；file 级标签只用于审计和追溯。\n"
-        "3. 未审核区域一律 unknown，不参与训练、阈值校准和评估。\n"
-        "4. 原 `data/labels.csv` 保持原样，作为历史记录。\n",
-        encoding="utf-8",
-    )
-    return records, anns, warnings
-
-
 def import_simple(
     audio_dir: str | Path,
     labels_path: str | Path,
@@ -539,9 +439,9 @@ def import_simple(
     assume_unlabeled_normal: bool = False,
     reviewed_files: set[str] | None = None,
 ) -> tuple[list[AudioRecord], list[Annotation], list[str]]:
-    """Import "audio folder + interval labels" without requiring metadata.
+    """Import audio + file/interval labels without requiring metadata.
 
-    Labels may be CSV with ``file,start_s,end_s,label[,group,fault_type,note]``
+    Labels may be CSV with ``file,label[,start_s,end_s,precision,group]``
     or JSON with the same keys.  Duration/sample rate/channels are read from
     the WAV header.  ``device_id``/``recorded_at`` stay empty and are never
     model features.
@@ -560,7 +460,7 @@ def import_simple(
     warnings: list[str] = []
     reviewed_set = {str(x).strip() for x in (reviewed_files or set()) if str(x).strip()}
 
-    files = sorted(audio_dir.rglob("*.wav"))
+    files = sorted(p for p in audio_dir.rglob("*") if p.is_file() and p.suffix.lower() == ".wav")
     if not files:
         raise ValueError(f"目录里没有 WAV: {audio_dir}")
 
@@ -587,7 +487,7 @@ def import_simple(
     if labels_path.suffix.lower() == ".json":
         raw = json.loads(labels_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
-            raw = raw.get("annotations") or raw.get("labels") or []
+            raw = raw.get("annotations", raw.get("labels"))
         if not isinstance(raw, list):
             raise ValueError("JSON 标注需要是数组，或包含 annotations/labels 数组")
         rows = raw
@@ -602,7 +502,8 @@ def import_simple(
         fname = row.get("file") or row.get("audio") or row.get("audio_id") or row.get("path") or ""
         if not fname:
             raise ValueError(f"第 {i} 条标注缺少 file/audio_id")
-        label = str(row.get("label") or "uncertain").strip().lower()
+        value = row.get("label")
+        label = "uncertain" if value is None else str(value).strip().lower()
         if label in {"正常", "n", "0"}:
             label = "normal"
         elif label in {"异常", "abnormal", "1"}:
@@ -611,9 +512,18 @@ def import_simple(
             label = "uncertain"
         if label not in LABELS:
             raise ValueError(f"第 {i} 条标注 label 非法: {label}")
+        raw_start = row.get("start_s", row.get("start"))
+        raw_end = row.get("end_s", row.get("end"))
+        has_start = raw_start is not None and str(raw_start).strip() != ""
+        has_end = raw_end is not None and str(raw_end).strip() != ""
+        precision = str(row.get("precision") or ("interval" if has_start or has_end else "file")).strip()
+        if precision not in PRECISIONS:
+            raise ValueError(f"第 {i} 条标注 precision 必须为 file 或 interval")
+        if has_start != has_end or (precision == "interval" and not has_start):
+            raise ValueError(f"第 {i} 条区间标注必须同时填写 start_s/end_s")
         try:
-            start = float(row.get("start_s", row.get("start", "")))
-            end = float(row.get("end_s", row.get("end", "")))
+            start = float(raw_start) if has_start else None
+            end = float(raw_end) if has_end else None
         except (TypeError, ValueError):
             raise ValueError(f"第 {i} 条标注 start_s/end_s 不是数字") from None
         path = resolve_file(str(fname))
@@ -623,6 +533,7 @@ def import_simple(
                 "start_s": start,
                 "end_s": end,
                 "label": label,
+                "precision": precision,
                 "group": str(row.get("group") or row.get("source_id") or "").strip(),
                 "fault_type": str(row.get("fault_type") or "").strip(),
                 "note": str(row.get("note") or "").strip(),
@@ -680,11 +591,13 @@ def import_simple(
     for i, row in enumerate(parsed, 1):
         audio_id = audio_id_by_path[row["path"]]
         info = wav_info(row["path"])
-        if not (math.isfinite(row["start_s"]) and math.isfinite(row["end_s"])):
+        start = 0.0 if row["start_s"] is None else row["start_s"]
+        end = info.duration_s if row["end_s"] is None else row["end_s"]
+        if not (math.isfinite(start) and math.isfinite(end)):
             raise ValueError(f"第 {i} 条标注起止不是有限数字")
-        if row["end_s"] <= row["start_s"]:
+        if end <= start:
             raise ValueError(f"第 {i} 条标注 end_s 必须大于 start_s")
-        if row["start_s"] < 0 or row["end_s"] > info.duration_s + 0.05:
+        if start < 0 or end > info.duration_s + 0.05:
             raise ValueError(
                 f"第 {i} 条标注越界: {row['start_s']}..{row['end_s']}，"
                 f"音频 {info.duration_s:.3f}s"
@@ -693,10 +606,10 @@ def import_simple(
             Annotation(
                 annotation_id=f"simple_{i:05d}",
                 audio_id=audio_id,
-                start_s=row["start_s"],
-                end_s=min(row["end_s"], info.duration_s),
+                start_s=start,
+                end_s=min(end, info.duration_s),
                 label=row["label"],
-                precision="interval",
+                precision=row["precision"],
                 fault_type=row["fault_type"],
                 note=row["note"],
                 version="simple",
@@ -716,12 +629,12 @@ def import_simple(
     if records_missing and not assume_unlabeled_normal:
         warnings.append(f"{len(records_missing)} 个音频没有标注，将保持 unknown")
 
-    write_manifest(records, manifest_out)
-    write_annotations(anns, annotations_out)
     errors, more_warnings = validate_dataset(records, anns, manifest_out, check_audio=True)
     warnings.extend(more_warnings)
     if errors:
         raise ValueError("导入后校验失败：\n" + "\n".join(errors))
+    write_manifest(records, manifest_out)
+    write_annotations(anns, annotations_out)
     return records, anns, warnings
 
 

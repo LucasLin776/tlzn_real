@@ -1,2 +1,0 @@
-file,label,fault_type,start_s,end_s,note
-A01_01_20261030_120227.wav,anomaly,unknown,0,30,用户确认整段为异常；含多次宽带爆发；无秒级标注

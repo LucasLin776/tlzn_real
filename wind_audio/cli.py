@@ -21,7 +21,6 @@ from .data import (
     dataset_summary,
     import_simple,
     label_mask,
-    migrate_legacy_labels,
     read_annotations,
     read_manifest,
     regions_from_mask,
@@ -159,7 +158,7 @@ def cmd_import_simple(args) -> int:
         assume_unlabeled_normal=args.assume_unlabeled_normal,
         reviewed_files=reviewed,
     )
-    print(f"已导入 {len(records)} 个音频，{len(anns)} 条区间标注")
+    print(f"已导入 {len(records)} 个音频，{len(anns)} 条标注")
     print(f"  manifest: {args.manifest}")
     print(f"  annotations: {args.annotations}")
     if args.assume_unlabeled_normal:
@@ -169,17 +168,6 @@ def cmd_import_simple(args) -> int:
     else:
         mode = "保持 unknown"
     print(f"  未标注区域: {mode}")
-    for w in warnings:
-        print(f"警告: {w}")
-    return 0
-
-
-def cmd_migrate(args) -> int:
-    records, anns, warnings = migrate_legacy_labels(
-        args.labels, args.audio_dir, args.manifest, args.annotations
-    )
-    print(f"迁移完成：{len(records)} 个音频，{len(anns)} 条标注 -> {args.manifest}, {args.annotations}")
-    print("旧 labels.csv 未修改；file 级粗标不会变成逐帧真值。")
     for w in warnings:
         print(f"警告: {w}")
     return 0
@@ -205,8 +193,30 @@ def cmd_split(args) -> int:
 # ---------------------------------------------------------------- evaluate
 def cmd_evaluate(args) -> int:
     detector = _detector_from_args(args)
-    records, anns, errors, _ = _load_dataset(args)
-    _require_clean(errors)
+    out = Path(args.out)
+    if out.exists() and (not out.is_dir() or any(out.iterdir())):
+        raise ValueError("评估输出目录非空，请使用新目录，避免覆盖结果或标注")
+    if args.audio_dir:
+        if not args.labels or args.annotations:
+            raise ValueError("--audio-dir 必须搭配 --labels，不能同时传 --annotations")
+        manifest = out / "manifest.csv"
+        if Path(args.labels).is_dir():
+            from .markers import import_markers
+            records, anns, warnings = import_markers(
+                args.audio_dir, args.labels, manifest, out / "annotations.csv",
+                pairing=args.pairing, assume_unlabeled_normal=args.assume_unlabeled_normal)
+        else:
+            if args.pairing != "stem":
+                raise ValueError("--pairing 仅用于标注目录")
+            records, anns, warnings = import_simple(
+                args.audio_dir, args.labels, manifest, out / "annotations.csv",
+                assume_unlabeled_normal=args.assume_unlabeled_normal)
+    else:
+        if not args.annotations or args.labels or args.assume_unlabeled_normal or args.pairing != "stem":
+            raise ValueError("--manifest 必须搭配 --annotations；导入选项仅用于 --audio-dir")
+        manifest = Path(args.manifest)
+        records, anns, errors, warnings = _load_dataset(args)
+        _require_clean(errors)
     if args.splits:
         split = load_splits(args.splits)
         assert_no_leakage(split)
@@ -214,18 +224,28 @@ def cmd_evaluate(args) -> int:
     else:
         audio_ids = [r.audio_id for r in records]
     result = evaluate_detector(
-        detector, records, anns, audio_ids, args.manifest, detector.feature_config,
+        detector, records, anns, audio_ids, manifest, detector.feature_config,
         iou_threshold=args.match_iou,
     )
     result["detector_config"] = detector.to_dict()
     result["selection"] = args.split if args.splits else "all_manifest"
+    result["input"] = {"manifest": str(manifest.resolve()), "labels": args.labels,
+                       "annotations": args.annotations, "pairing": args.pairing if args.audio_dir else None,
+                       "assume_unlabeled_normal": args.assume_unlabeled_normal}
+    result["warnings"] = warnings
+    if result["file_accuracy"] is None and result["time_accuracy"] is None:
+        raise ValueError("没有可评估标签；请提供文件标签、精确区间，或确认完整审核后设置 --assume-unlabeled-normal")
     metrics, brief = write_eval_outputs(result, args.out)
+    from .evaluate import _percent
+    print(f"文件准确率={_percent(result['file_accuracy'])}；时长准确率={_percent(result['time_accuracy'])}")
     print(f"L1 窗口评估：GT={result['n_gt_events']}，预测={result['n_pred_events']}")
     print(f"召回={result['event_recall']}；精确率={result['event_precision']}；"
           f"FA/h={result['fa_per_hour']}；覆盖={result['coverage']}")
     if not result["n_gt_events"]:
         print("没有精确异常区间，不能计算召回；请勿把整段粗标当精确窗口。")
-    print(f"输出: {metrics}, {brief}")
+    for warning in warnings:
+        print(f"提示: {warning}")
+    print(f"输出: {metrics}, {brief}, {out / 'per_file.csv'}, {out / 'events.csv'}")
     return 0
 
 
@@ -581,9 +601,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--json", action="store_true")
     c.set_defaults(func=cmd_check)
 
-    imp = sub.add_parser("import-simple", help="只有音频+区间标注：自动生成 manifest")
+    imp = sub.add_parser("import-simple", help="音频+整段/区间标签：自动生成 manifest")
     imp.add_argument("--audio-dir", required=True)
-    imp.add_argument("--labels", required=True, help="CSV/JSON：file,start_s,end_s,label[,group,fault_type,note]")
+    imp.add_argument("--labels", required=True, help="CSV/JSON：file,label[,start_s,end_s,precision,group]")
     imp.add_argument("--manifest", default="data/manifest.csv")
     imp.add_argument("--annotations", default="data/annotations.csv")
     imp.add_argument("--assume-unlabeled-normal", action="store_true",
@@ -591,13 +611,6 @@ def build_parser() -> argparse.ArgumentParser:
     imp.add_argument("--reviewed-list", default=None,
                      help="每行一个文件名/相对路径，表示该文件整段已审核（未标注部分为 normal）")
     imp.set_defaults(func=cmd_import_simple)
-
-    m = sub.add_parser("migrate-labels", help="迁移旧 labels.csv（不修改原文件）")
-    m.add_argument("--labels", default="data/labels.csv")
-    m.add_argument("--audio-dir", default="data/anomaly")
-    m.add_argument("--manifest", default="data/manifest.csv")
-    m.add_argument("--annotations", default="data/annotations.csv")
-    m.set_defaults(func=cmd_migrate)
 
     s = sub.add_parser("split", help="按录音/批次/设备分组划分")
     _add_data_args(s)
@@ -607,8 +620,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_split)
 
-    ev = sub.add_parser("evaluate", help="使用精确标注检验 L1 检测窗口；无需训练")
-    _add_data_args(ev)
+    ev = sub.add_parser("evaluate", help="音频送入 L1，与标签比较，输出准确率和事件指标")
+    source = ev.add_mutually_exclusive_group(required=True)
+    source.add_argument("--manifest", help="已有标准音频清单，搭配 --annotations")
+    source.add_argument("--audio-dir", help="WAV 目录，搭配 --labels")
+    ev.add_argument("--annotations", help="标准 annotations.csv")
+    ev.add_argument("--labels", help="简易 CSV/JSON 文件，或 Name/Start/Duration 标注目录")
+    ev.add_argument("--pairing", choices=["stem", "sorted"], default="stem",
+                    help="标注目录配对：同名 stem；用户确认编号与音频排序一致才选 sorted")
+    ev.add_argument("--assume-unlabeled-normal", action="store_true",
+                    help="声明所有音频已完整审核，未标注部分及空标注均为正常")
     _add_detector_args(ev)
     ev.add_argument("--splits", help="可选固定划分；不传则评估整个清单")
     ev.add_argument("--split", choices=["val", "test"], default="test")
@@ -646,7 +667,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    return int(args.func(args) or 0)
+    try:
+        return int(args.func(args) or 0)
+    except (ValueError, OSError) as exc:
+        print(f"错误: {exc}", file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
