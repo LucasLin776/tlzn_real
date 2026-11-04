@@ -403,14 +403,12 @@ def dataset_summary(
     reasons: list[str] = []
     sources = {r.source_id or r.audio_id for r in records}
     devices = {r.device_id for r in records if r.device_id}
-    if normal_s < 60:
-        reasons.append(f"已审核正常音频 {normal_s:.1f}s < 60s，不足以训练基线/有监督模型")
+    if normal_s == 0:
+        reasons.append("没有已审核正常时长，无法计算正常区误报率；不影响 L1 直接检测")
+    if events == 0:
+        reasons.append("没有精确异常区间，无法计算事件召回；整段粗标仅供查看")
     if len(sources) < 3:
-        reasons.append("至少需要 3 个独立录音/批次，当前不足以做 train/val/test 分组划分")
-    if anomaly_s < 10:
-        reasons.append(f"已审核异常音频 {anomaly_s:.1f}s < 10s，不足以训练有监督模型")
-    if events < 3:
-        reasons.append(f"独立异常事件 {events} < 3，不足以做事件级评估")
+        reasons.append("独立来源不足 3 个，暂不能建立 L2 的 train/val/test 划分")
 
     return {
         "files": len(records),

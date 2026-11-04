@@ -1,4 +1,4 @@
-"""L1 training, inference, review, and the shared command-line entry point."""
+"""Training-free L1 windows, evaluation, review, and shared L2 commands."""
 from __future__ import annotations
 
 import argparse
@@ -14,8 +14,6 @@ from pathlib import Path
 import numpy as np
 
 from .audio import load_wav, wav_info, write_wav
-from .backends import backend_versions
-from .calibrate import apply_calibration, calibrate_detector
 from .data import (
     AudioRecord,
     Annotation,
@@ -31,18 +29,11 @@ from .data import (
     validate_dataset,
     write_annotations,
 )
-from .detectors import (
-    DEFAULT_POSTPROCESS,
-    BaselineDetector,
-    SupervisedDetector,
-    cap_training_data,
-    load_detector,
-)
+from .detectors import SpectralChangeDetector, load_detector
 from .evaluate import evaluate_detector, write_eval_outputs
-from .events import extract_events
-from .features import FeatureConfig, build_matrix, extract_features, load_or_extract
+from .features import FeatureConfig, extract_features
 from .render import score_png, spectrogram_png, waveform_png
-from .report import write_report
+from .report import write_report, write_batch_report
 from .review import (
     export_template,
     import_reviews,
@@ -80,38 +71,25 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", name)[:80] or "audio"
 
 
-def _feature_overrides(args) -> dict:
-    out = {}
-    for key in ("sr", "n_fft", "hop", "n_mels", "fmin", "fmax", "target_step", "context_s", "normalize"):
+def _detector_from_args(args):
+    base = load_detector(args.config)
+    cfg = base.feature_config.to_dict()
+    for key in cfg:
         value = getattr(args, key, None)
         if value is not None:
-            out[key] = value
-    return out
-
-
-def _cfg_from_args(args) -> FeatureConfig:
-    base = FeatureConfig().to_dict()
-    base.update(_feature_overrides(args))
-    return FeatureConfig.from_dict(base)
-
-
-def _assert_model_cfg(detector, args) -> None:
-    overrides = _feature_overrides(args)
-    if not overrides:
-        return
-    cfg = detector.feature_config
-    for key, value in overrides.items():
-        if isinstance(value, float) and isinstance(getattr(cfg, key), float):
-            if abs(value - getattr(cfg, key)) > 1e-9:
-                raise SystemExit(
-                    f"--{key} 与模型特征配置不一致（模型 {getattr(cfg, key)}，命令 {value}）。"
-                    "推理不允许临时改特征参数；请用训练时的配置。"
-                )
-        elif value != getattr(cfg, key):
-            raise SystemExit(
-                f"--{key} 与模型特征配置不一致（模型 {getattr(cfg, key)}，命令 {value}）。"
-                "推理不允许临时改特征参数；请用训练时的配置。"
-            )
+            cfg[key] = value
+    pp = dict(base.postprocess)
+    for arg, key in (("min_dur", "min_duration"), ("merge_gap", "merge_gap"),
+                     ("low_ratio", "low_ratio"), ("padding", "padding"),
+                     ("reference_s", "reference_s"), ("release_db", "release_db"),
+                     ("quiet_s", "quiet_s"), ("settle_s", "settle_s"),
+                     ("stability_db", "stability_db"), ("min_prominence", "min_prominence"),
+                     ("relative_floor_db", "relative_floor_db")):
+        value = getattr(args, arg, None)
+        if value is not None:
+            pp[key] = value
+    threshold = base.threshold if args.threshold is None else args.threshold
+    return SpectralChangeDetector(FeatureConfig.from_dict(cfg), threshold, pp)
 
 
 def _load_dataset(args, check_audio: bool = True):
@@ -142,7 +120,8 @@ def cmd_check(args) -> int:
         "summary": summary,
         "errors": errors,
         "warnings": warnings,
-        "backend_versions": backend_versions(),
+        "runtime": {"numpy": np.__version__},
+        "l1_requires_training": False,
     }
     if args.json:
         print(json.dumps(_json_safe(payload), ensure_ascii=False, indent=2))
@@ -153,7 +132,7 @@ def cmd_check(args) -> int:
         print(f"异常事件 {summary['anomaly_events']} 个 · 完整审核文件 {summary['fully_reviewed_files']} "
               f"· 含粗标文件 {summary['coarse_label_files']}")
         if summary["reasons"]:
-            print("\n不足以训练/评估的原因：")
+            print("\n评估与 L2 数据提示（不阻止 L1 直接推理）：")
             for reason in summary["reasons"]:
                 print(f"- {reason}")
         if warnings:
@@ -223,135 +202,30 @@ def cmd_split(args) -> int:
     return 0
 
 
-# -------------------------------------------------------------------- train
-def _train_new(args) -> int:
-    records, anns, errors, _ = _load_dataset(args)
-    _require_clean(errors)
-    if not Path(args.splits).exists():
-        raise SystemExit(f"划分文件不存在: {args.splits}（先运行 split）")
-    split = load_splits(args.splits)
-    assert_no_leakage(split)
-    cfg = _cfg_from_args(args)
-    if args.detector == "baseline":
-        detector = BaselineDetector.train(
-            records, anns, split.train, args.manifest, cfg,
-            version=args.version, threshold=args.threshold,
-            max_frames_per_file=args.max_samples_per_file, seed=args.seed,
-        )
-    else:
-        data = build_matrix(
-            records, anns, split.train, args.manifest, cfg, args.cache_dir
-        )
-        if len(data["X"]) == 0:
-            raise SystemExit("训练集没有已审核样本；检查标注覆盖范围。")
-        capped = cap_training_data(
-            data["X"], data["y"], data["groups"], data["file_ids"], data["times"],
-            max_total=args.max_total_samples, max_per_file=args.max_samples_per_file, seed=args.seed,
-        )
-        meta = {
-            "audio_ids": split.train,
-            "file_ids": capped["file_ids"].tolist(),
-            "training": {
-                "available": capped["available"],
-                "selected": capped["selected"],
-            },
-        }
-        detector, selection = SupervisedDetector.train(
-            capped["X"], capped["y"], data["feature_names"], cfg,
-            version=args.version, seed=args.seed, metadata=meta,
-        )
-        print(f"分类后端：请求 {selection.requested}，实际 {selection.used}"
-              + ("（回退）" if selection.fallback else ""))
-        if selection.reason:
-            print(f"  原因: {selection.reason}")
-
-    detector.metadata["split"] = {
-        "train": split.train, "val": split.val, "test": split.test,
-        "seed": split.seed, "group_by": split.group_by,
-    }
-    out = Path(args.out)
-    detector.save(out)
-
-    if not args.no_calibrate:
-        try:
-            calib = calibrate_detector(
-                detector, records, anns, split.val, args.manifest,
-                target_recall=args.target_recall,
-            )
-            apply_calibration(detector, calib)
-            detector.save(out)
-            _write_json(out / "calibration.json", calib)
-            print(f"校准：阈值 {calib['selected']['threshold']:.4f}，"
-                  f"目标召回 {args.target_recall:.2f}，"
-                  f"{'达到' if calib['target_reached'] else '未达到'}；"
-                  f"验证集召回 {calib['validation']['event_recall']}")
-        except Exception as exc:
-            print(f"校准失败（模型保留未校准状态）：{exc}", file=sys.stderr)
-            detector.calibrated = False
-            detector.save(out)
-
-    print(f"模型已保存: {out}")
-    print(f"  版本={detector.version} 检测器={detector.detector_type} "
-          f"分数类型={detector.score_type} 阈值={detector.threshold}")
-    return 0
-
-
-def cmd_train(args) -> int:
-    return _train_new(args)
-
-
-# --------------------------------------------------------------- calibrate
-def cmd_calibrate(args) -> int:
-    if args.split != "val":
-        raise ValueError("只能使用 val 校准；test 必须保留为独立测试集")
-    detector = load_detector(args.model)
-    records, anns, errors, _ = _load_dataset(args)
-    _require_clean(errors)
-    split = load_splits(args.splits)
-    assert_no_leakage(split)
-    audio_ids = split.val
-    calib = calibrate_detector(
-        detector, records, anns, audio_ids, args.manifest,
-        target_recall=args.target_recall,
-    )
-    apply_calibration(detector, calib)
-    detector.save(args.model)
-    _write_json(Path(args.model) / "calibration.json", calib)
-    print(f"校准完成：阈值 {calib['selected']['threshold']:.4f}，"
-          f"目标召回 {args.target_recall:.2f}，"
-          f"{'达到' if calib['target_reached'] else '未达到'}")
-    print(f"验证集：召回 {calib['validation']['event_recall']}，"
-          f"精确率 {calib['validation']['event_precision']}，"
-          f"FA/h {calib['validation']['fa_per_hour']}")
-    return 0
-
-
 # ---------------------------------------------------------------- evaluate
 def cmd_evaluate(args) -> int:
-    detector = load_detector(args.model)
+    detector = _detector_from_args(args)
     records, anns, errors, _ = _load_dataset(args)
     _require_clean(errors)
-    split = load_splits(args.splits)
-    audio_ids = split.ids(args.split)
-    assert_no_leakage(split)
-    pp = {}
-    for key in ("min_duration", "merge_gap", "low_ratio"):
-        value = getattr(args, key, None)
-        if value is not None:
-            pp[key] = value
-    if (args.threshold is not None or pp) and args.split == "test":
-        print("警告：在 test 上覆盖阈值/后处理，结果不再是冻结模型的正式测试成绩。", file=sys.stderr)
+    if args.splits:
+        split = load_splits(args.splits)
+        assert_no_leakage(split)
+        audio_ids = split.ids(args.split)
+    else:
+        audio_ids = [r.audio_id for r in records]
     result = evaluate_detector(
         detector, records, anns, audio_ids, args.manifest, detector.feature_config,
-        threshold=args.threshold, postprocess=pp or None, iou_threshold=args.match_iou,
+        iou_threshold=args.match_iou,
     )
-    out = Path(args.out)
-    metrics_path, brief_path = write_eval_outputs(result, out)
-    print(f"评估：{args.split} 集，{result['files']} 文件，"
-          f"GT {result['n_gt_events']}，预测 {result['n_pred_events']}")
-    print(f"  召回 {result['event_recall']}；精确率 {result['event_precision']}；"
-          f"FA/h {result['fa_per_hour']}；覆盖 {result['coverage']}")
-    print(f"  指标: {metrics_path}\n  简报: {brief_path}")
+    result["detector_config"] = detector.to_dict()
+    result["selection"] = args.split if args.splits else "all_manifest"
+    metrics, brief = write_eval_outputs(result, args.out)
+    print(f"L1 窗口评估：GT={result['n_gt_events']}，预测={result['n_pred_events']}")
+    print(f"召回={result['event_recall']}；精确率={result['event_precision']}；"
+          f"FA/h={result['fa_per_hour']}；覆盖={result['coverage']}")
+    if not result["n_gt_events"]:
+        print("没有精确异常区间，不能计算召回；请勿把整段粗标当精确窗口。")
+    print(f"输出: {metrics}, {brief}")
     return 0
 
 
@@ -379,6 +253,9 @@ def _events_csv(events: list[dict], path: Path) -> None:
         "score_type", "threshold", "centroid_hz", "flatness", "peak_freq_hz",
         "harmonicity_db", "share_0_200", "share_200_1k", "share_1k_4k",
         "share_4k_10k", "share_10k_up", "onset_slope_per_s", "at_edge",
+        "trigger_start_s", "trigger_end_s", "window_path",
+        "boundary_reason", "right_censored", "peak_activity_db", "peak_prominence",
+        "peak_level_dbfs", "level_floor_dbfs",
         "clip_path", "clip_start_s", "clip_end_s",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -388,6 +265,7 @@ def _events_csv(events: list[dict], path: Path) -> None:
         for ev in events:
             clip = ev.get("clip") or {}
             row = {k: ev.get(k) for k in fields}
+            row["window_path"] = (ev.get("window") or {}).get("path")
             row["clip_path"] = clip.get("path")
             row["clip_start_s"] = clip.get("start_s")
             row["clip_end_s"] = clip.get("end_s")
@@ -411,6 +289,8 @@ def _run_one(
     manifest_path: Path | None = None,
     reviews_by_id: dict | None = None,
 ) -> dict:
+    if clip_context < 0 or not np.isfinite(clip_context):
+        raise ValueError("试听上下文必须为有限非负数")
     x, sr = load_wav(path, target_sr=cfg.sr)
     if len(x) == 0:
         raise ValueError(f"空音频: {path}")
@@ -428,7 +308,7 @@ def _run_one(
                 audio_id = rec.audio_id
                 break
     bundle = extract_features(x, sr, cfg, audio_id)
-    events = detector.predict_events(bundle, threshold=threshold, postprocess=postprocess)
+    events, traces = detector.analyze(bundle, threshold=threshold, postprocess=postprocess)
     from .l2.common import digest, file_hash
     audio_hash = file_hash(path)
     for ev in events:
@@ -445,8 +325,16 @@ def _run_one(
     audio_rel = _copy_audio(path, out_dir, audio_id)
     clips_dir = out_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)
+    windows_dir = out_dir / "windows"
+    windows_dir.mkdir(parents=True, exist_ok=True)
     for ev in events:
-        clip = _make_clip(x, sr, ev["start_s"], ev["end_s"], clips_dir / f"{_safe_name(ev['event_id'])}.wav", clip_context, duration)
+        # Long recording names must never truncate the distinguishing event ID.
+        wav_name = f"event_{digest(ev['event_id'])[:20]}.wav"
+        window = _make_clip(x, sr, ev["start_s"], ev["end_s"],
+                            windows_dir / wav_name, 0.0, duration)
+        window["path"] = f"windows/{window['path']}"
+        ev["window"] = window
+        clip = _make_clip(x, sr, ev["start_s"], ev["end_s"], clips_dir / wav_name, clip_context, duration)
         clip["path"] = f"clips/{clip['path']}"
         ev["clip"] = clip
 
@@ -455,11 +343,25 @@ def _run_one(
         bundle.spec_db, bundle.freqs, bundle.mel_times, duration, events, regions,
         out_dir / "spectrogram.png", f_max=min(fmax_plot, cfg.fmax, sr / 2),
     )
-    score = detector.score(bundle)
+    score = traces["change_db"]
     score_png(bundle.times, score, threshold, events, regions, duration, out_dir / "score.png")
+    score_png(bundle.times, traces["activity_db"], postprocess["release_db"], events, regions,
+              duration, out_dir / "activity.png")
+    with (out_dir / "scores.csv").open("w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["time_s", "change_db", "threshold_high", "threshold_low",
+                         "activity_db", "release_db", "prominence", "level_dbfs",
+                         "level_floor_dbfs", "event_active"])
+        writer.writerows(zip(bundle.times, score,
+                            np.full(len(score), threshold), np.full(len(score), threshold * postprocess["low_ratio"]),
+                            traces["activity_db"], np.full(len(score), postprocess["release_db"]),
+                            traces["prominence"], traces["level_dbfs"],
+                            np.full(len(score), traces["level_floor_dbfs"]), traces["active"].astype(int)))
+    effective_config = {**detector.to_dict(), "threshold": threshold, "postprocess": postprocess}
+    _write_json(out_dir / "l1_config.json", effective_config)
 
     payload = {
-        "schema_version": "2.0",
+        "schema_version": "3.1",
         "audio": {
             "id": audio_id,
             "file": path.name,
@@ -477,11 +379,12 @@ def _run_one(
             "threshold_source": threshold_source,
             "postprocess": postprocess,
             "postprocess_source": postprocess_source,
-            "calibrated": detector.calibrated,
-            "demo": detector.demo,
-            "backend": detector.metadata.get("backend"),
+            "requires_training": False,
+            "feature_config": cfg.to_dict(),
         },
         "events": events,
+        "diagnostics": {"level_floor_dbfs": traces["level_floor_dbfs"],
+                        "rejected_candidates": traces["rejected_triggers"]},
         "annotations": {"regions": regions, "gt_events": gt, "source": str(record.audio_id) if record else None},
     }
     _write_json(out_dir / "events.json", payload)
@@ -500,10 +403,7 @@ def _run_one(
         score_type=detector.score_type,
         threshold=threshold,
         threshold_source=threshold_source,
-        calibrated=detector.calibrated,
-        calibration=detector.metadata.get("calibration"),
-        demo=detector.demo,
-        backend=detector.metadata.get("backend"),
+
         feature_config=cfg.to_dict(),
         postprocess=postprocess,
         events=events,
@@ -513,13 +413,19 @@ def _run_one(
         audio_relpath=audio_rel,
         review_relpath="review.csv",
     )
-    return {"audio_id": audio_id, "events": len(events), "report": str(report), "out": str(out_dir)}
+    return {"audio_id": audio_id, "file": path.name, "source": str(path.resolve()),
+            "audio_sha256": audio_hash, "duration_s": duration,
+            "events": len(events), "alarm_s": sum(e["duration_s"] for e in events),
+            "windows": [{"start_s": e["start_s"], "end_s": e["end_s"],
+                         "right_censored": e["right_censored"]} for e in events],
+            "filtered_candidates": len(traces["rejected_triggers"]),
+            "report": str(report), "out": str(out_dir)}
 
 
 def cmd_run(args) -> int:
     input_path = Path(args.input)
     if input_path.is_dir():
-        files = sorted(input_path.rglob("*.wav"))
+        files = sorted(p for p in input_path.rglob("*") if p.is_file() and p.suffix.lower() == ".wav")
     elif input_path.is_file():
         files = [input_path]
     else:
@@ -529,8 +435,7 @@ def cmd_run(args) -> int:
         print(f"没有 wav: {input_path}", file=sys.stderr)
         return 2
 
-    detector = load_detector(args.model)
-    _assert_model_cfg(detector, args)
+    detector = _detector_from_args(args)
     cfg = detector.feature_config
 
     records, anns = [], []
@@ -541,24 +446,16 @@ def cmd_run(args) -> int:
     if args.review:
         reviews_by_id = {r.event_id: r.to_row() for r in read_reviews(args.review)}
 
-    threshold = None if args.threshold is None else float(args.threshold)
-    threshold_source = "cli" if threshold is not None else (
-        "calibration" if detector.calibrated else "model"
-    )
-    pp_override = {
-        "min_duration": args.min_dur,
-        "merge_gap": args.merge_gap,
-        "low_ratio": args.low_ratio,
-    }
-    pp_override = {k: v for k, v in pp_override.items() if v is not None}
-    pp_source = "cli" if pp_override else "model"
+    threshold = detector.threshold
+    threshold_source = "cli" if args.threshold is not None else ("config" if args.config else "default")
+    pp = detector.postprocess
+    pp_source = "effective_config"
 
     out_base = Path(args.out) if args.out else Path("runs")
-    results = []
+    results, failures = [], []
     for path in files:
         det = detector
-        thr = det.threshold if threshold is None else threshold
-        pp = {**DEFAULT_POSTPROCESS, **det.postprocess, **pp_override}
+        thr = threshold
         if len(files) == 1 and args.out:
             out_dir = out_base
         else:
@@ -576,9 +473,20 @@ def cmd_run(args) -> int:
             )
         except Exception as exc:
             print(f"{path.name}: 跳过（{exc}）", file=sys.stderr)
+            failures.append({"file": path.name, "source": str(path.resolve()), "error": str(exc)})
             continue
         results.append(result)
         print(f"{path.name}: {result['events']} 事件 -> {result['report']}")
+    if input_path.is_dir():
+        out_base.mkdir(parents=True, exist_ok=True)
+        summary = {"files_requested": len(files), "files_succeeded": len(results), "failures": failures,
+                   "detector_config": detector.to_dict(), "files": results,
+                   "total_events": sum(r["events"] for r in results),
+                   "total_duration_s": sum(r["duration_s"] for r in results),
+                   "total_alarm_s": sum(r["alarm_s"] for r in results),
+                   "note": "检测输出，不是准确率验证；无精确标注不能计算召回或误报率。"}
+        _write_json(out_base / "summary.json", summary)
+        print(f"批量总览: {write_batch_report(out_base, summary)}")
     return 0 if len(results) == len(files) else 1
 
 
@@ -634,16 +542,24 @@ def cmd_probe(args) -> int:
 
 
 # ------------------------------------------------------------------- parser
-def _add_feature_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--sr", type=int, default=None)
-    p.add_argument("--n-fft", dest="n_fft", type=int, default=None)
-    p.add_argument("--hop", type=int, default=None)
-    p.add_argument("--n-mels", dest="n_mels", type=int, default=None)
-    p.add_argument("--fmin", type=float, default=None)
-    p.add_argument("--fmax", type=float, default=None)
-    p.add_argument("--target-step", dest="target_step", type=float, default=None)
-    p.add_argument("--context", dest="context_s", type=float, default=None)
-    p.add_argument("--normalize", choices=["none", "per_file"], default=None)
+def _add_detector_args(p):
+    p.add_argument("--config", help="可选 L1 JSON 配置；不传则使用内置默认值，无需训练")
+    p.add_argument("--threshold", type=float, help="频谱变化阈值，默认 6 dB")
+    p.add_argument("--min-dur", type=float, help="跟踪事件最短时长，默认 0.06 秒")
+    p.add_argument("--merge-gap", type=float, help="相邻完整事件合并间隔，默认 0.35 秒")
+    p.add_argument("--low-ratio", type=float, help="边缘种子退出/进入比值，非完整事件结束阈值，默认 0.6")
+    p.add_argument("--padding", type=float, help="检测窗口两端补充，默认各 0.05 秒")
+    p.add_argument("--reference-s", type=float, help="触发前局部背景长度，默认 0.6 秒")
+    p.add_argument("--release-db", type=float, help="持续活动释放阈值，默认 3 dB；越低尾部越长")
+    p.add_argument("--quiet-s", type=float, help="背景恢复需连续维持时长，默认 0.25 秒")
+    p.add_argument("--settle-s", type=float, help="新稳定工况确认时长，默认 0.6 秒")
+    p.add_argument("--stability-db", type=float, help="新工况的谱形/能量稳定容差，默认 1.5 dB")
+    p.add_argument("--min-prominence", type=float, help="事件与背景的能量差异比例下限，默认 0.3；越大过滤越强")
+    p.add_argument("--relative-floor-db", type=float, help="比录音强声参考低多少 dB 仍保留，默认 15；越小过滤越强")
+    for name in ("sr", "n-fft", "hop", "n-mels"):
+        p.add_argument("--" + name, type=int)
+    for name in ("fmin", "fmax", "target-step", "compare-s", "smooth-s", "dynamic-range-db"):
+        p.add_argument("--" + name, type=float)
 
 
 def _add_data_args(p: argparse.ArgumentParser, required: bool = True) -> None:
@@ -691,57 +607,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_split)
 
-    t = sub.add_parser("train", help="训练 L1 候选检测器")
-    _add_data_args(t)
-    t.add_argument("--splits", default="data/splits.json")
-    t.add_argument("--detector", choices=["baseline", "supervised"], default="baseline")
-    t.add_argument("--out", default="models/l1_v2")
-    t.add_argument("--version", default="l1_v2")
-    t.add_argument("--threshold", type=float, default=5.0)
-    t.add_argument("--target-recall", type=float, default=0.95)
-    t.add_argument("--seed", type=int, default=42)
-    t.add_argument("--max-total-samples", type=int, default=50000)
-    t.add_argument("--max-samples-per-file", type=int, default=5000)
-    t.add_argument("--cache-dir", default="cache/features")
-    t.add_argument("--no-calibrate", action="store_true")
-    _add_feature_args(t)
-    t.set_defaults(func=cmd_train)
-
-    cal = sub.add_parser("calibrate", help="在验证集上重选阈值与后处理")
-    cal.add_argument("--model", required=True)
-    _add_data_args(cal)
-    cal.add_argument("--splits", default="data/splits.json")
-    cal.add_argument("--split", choices=["val"], default="val")
-    cal.add_argument("--target-recall", type=float, default=0.95)
-    cal.set_defaults(func=cmd_calibrate)
-
-    ev = sub.add_parser("evaluate", help="在冻结模型上评估")
-    ev.add_argument("--model", required=True)
+    ev = sub.add_parser("evaluate", help="使用精确标注检验 L1 检测窗口；无需训练")
     _add_data_args(ev)
-    ev.add_argument("--splits", default="data/splits.json")
-    ev.add_argument("--split", choices=["train", "val", "test"], default="test")
-    ev.add_argument("--out", default="reports/eval_test")
-    ev.add_argument("--threshold", type=float, default=None)
-    ev.add_argument("--min-dur", dest="min_duration", type=float, default=None)
-    ev.add_argument("--merge-gap", dest="merge_gap", type=float, default=None)
-    ev.add_argument("--low-ratio", dest="low_ratio", type=float, default=None)
+    _add_detector_args(ev)
+    ev.add_argument("--splits", help="可选固定划分；不传则评估整个清单")
+    ev.add_argument("--split", choices=["val", "test"], default="test")
+    ev.add_argument("--out", default="reports/l1_evaluation")
     ev.add_argument("--match-iou", type=float, default=0.1)
     ev.set_defaults(func=cmd_evaluate)
 
-    r = sub.add_parser("run", help="单条/批量推理并生成报告")
+    r = sub.add_parser("run", help="直接检测频谱波动，输出异常候选窗口与切片")
     r.add_argument("--input", required=True)
-    r.add_argument("--model", required=True)
-    r.add_argument("--out", default=None)
-    r.add_argument("--manifest", default=None)
-    r.add_argument("--annotations", default=None)
-    r.add_argument("--threshold", type=float, default=None)
-    r.add_argument("--min-dur", dest="min_dur", type=float, default=None)
-    r.add_argument("--merge-gap", dest="merge_gap", type=float, default=None)
-    r.add_argument("--low-ratio", type=float, default=None)
-    r.add_argument("--fmax-plot", type=float, default=20000.0)
-    r.add_argument("--clip-context", type=float, default=3.0)
-    r.add_argument("--review", default=None, help="可选：已导入的 reviews.csv，用于报告显示人工结论")
-    _add_feature_args(r)
+    _add_detector_args(r)
+    r.add_argument("--out")
+    r.add_argument("--manifest")
+    r.add_argument("--annotations")
+    r.add_argument("--fmax-plot", type=float, default=20000)
+    r.add_argument("--clip-context", type=float, default=1.0,
+                   help="仅试听切片额外上下文，不改变检测窗口")
+    r.add_argument("--review", help="已审核记录，用于报告展示")
     r.set_defaults(func=cmd_run)
 
     rex = sub.add_parser("review-export", help="从 events.json 导出审核模板")

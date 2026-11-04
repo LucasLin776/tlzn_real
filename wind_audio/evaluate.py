@@ -25,8 +25,6 @@ from .data import (
     AudioRecord,
     Annotation,
     anomaly_events,
-    label_mask,
-    regions_from_mask,
     resolve_audio_path,
 )
 from .features import FeatureConfig, extract_features
@@ -66,82 +64,82 @@ def match_events(pred: list[dict], gt: list[dict], iou_threshold: float = 0.1) -
     }
 
 
-def evaluate_file_events(
-    record: AudioRecord,
-    anns: list[Annotation],
-    pred_events: list[dict],
-    iou_threshold: float = 0.1,
-) -> dict:
+def _reviewed_regions(record, anns):
+    """Continuous annotation boundaries: do not quantise short events to 100 ms."""
+    mine = [a for a in anns if a.audio_id == record.audio_id]
+    intervals = [a for a in mine if a.precision == "interval"]
+    points = sorted({0.0, record.duration_s} |
+                    {max(0.0, min(record.duration_s, t)) for a in intervals for t in (a.start_s, a.end_s)})
+    infer_normal = record.fully_reviewed and not any(
+        a.precision == "file" and a.label in {"anomaly", "uncertain"} for a in mine)
+    regions = []
+    for start, end in zip(points, points[1:]):
+        mid = (start + end) / 2
+        labels = {a.label for a in intervals if a.start_s <= mid < a.end_s}
+        label = (next(iter(labels)) if len(labels) == 1 else
+                 "normal" if not labels and infer_normal else "uncertain")
+        regions.append({"start_s": start, "end_s": end, "label": label})
+    return regions
+
+
+def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1):
+    if not 0 < iou_threshold <= 1:
+        raise ValueError("IoU 门槛需要在 (0,1] 内")
     gt = anomaly_events(record, anns)
-    mask = label_mask(record, anns, 0.1)
-    regions = regions_from_mask(mask)
+    regions = _reviewed_regions(record, anns)
     normal_s = sum(r["end_s"] - r["start_s"] for r in regions if r["label"] == "normal")
-    unknown_s = sum(r["end_s"] - r["start_s"] for r in regions if r["label"] == "uncertain")
     anomaly_s = sum(r["end_s"] - r["start_s"] for r in regions if r["label"] == "anomaly")
     reviewed_s = normal_s + anomaly_s
-
-    reviewed: list[dict] = []
-    excluded_unknown = 0
+    reviewed, excluded = [], 0
     for p in pred_events:
-        a = max(0.0, float(p["start_s"]))
-        b = min(record.duration_s, float(p["end_s"]))
+        a, b = max(0.0, p["start_s"]), min(record.duration_s, p["end_s"])
         if b <= a:
             continue
         ov_n = sum(_overlap(a, b, r["start_s"], r["end_s"]) for r in regions if r["label"] == "normal")
         ov_a = sum(_overlap(a, b, r["start_s"], r["end_s"]) for r in regions if r["label"] == "anomaly")
-        ov_u = sum(_overlap(a, b, r["start_s"], r["end_s"]) for r in regions if r["label"] == "uncertain")
-        if ov_n + ov_a <= 1e-9 and ov_u > 1e-9:
-            excluded_unknown += 1
+        if ov_n + ov_a <= 1e-12:
+            excluded += 1
             continue
-        q = dict(p)
-        q.update({"start_s": a, "end_s": b, "_ov_n": ov_n, "_ov_a": ov_a})
-        reviewed.append(q)
-
-    match = match_events(reviewed, gt, iou_threshold)
-    matched_pred = {m["pred_index"] for m in match["matches"]}
-    matched_gt = {m["gt_index"] for m in match["matches"]}
-    fp_events = 0
-    fp_normal_s = 0.0
+        reviewed.append({**p, "start_s": a, "end_s": b, "_ov_n": ov_n, "_reviewed": ov_n + ov_a})
+    # IoU uses only reviewed prediction duration; unknown is neither TP nor FP.
+    pairs = []
     for i, p in enumerate(reviewed):
-        if i in matched_pred:
-            continue
-        if p["_ov_n"] > 1e-9:
-            fp_events += 1
-            fp_normal_s += float(p["_ov_n"])
-
-    gt_duration = sum(g["end_s"] - g["start_s"] for g in gt)
-    inter = 0.0
-    start_err = []
-    end_err = []
-    for m in match["matches"]:
-        p = reviewed[m["pred_index"]]
-        g = gt[m["gt_index"]]
-        inter += _overlap(p["start_s"], p["end_s"], g["start_s"], g["end_s"])
-        start_err.append(abs(p["start_s"] - g["start_s"]))
-        end_err.append(abs(p["end_s"] - g["end_s"]))
-
-    alarm_s = sum(p["end_s"] - p["start_s"] for p in reviewed)
+        for j, g in enumerate(gt):
+            overlap = _overlap(p["start_s"], p["end_s"], g["start_s"], g["end_s"])
+            union = p["_reviewed"] + g["end_s"] - g["start_s"] - overlap
+            value = overlap / union if union > 0 else 0.0
+            if value >= iou_threshold:
+                pairs.append((value, i, j))
+    used_p, used_g, matches = set(), set(), []
+    for value, i, j in sorted(pairs, reverse=True):
+        if i not in used_p and j not in used_g:
+            used_p.add(i)
+            used_g.add(j)
+            matches.append((i, j))
+    # Alarm time uses the UNION of windows and includes normal overlap even for matched events.
+    merged = []
+    for p in sorted(reviewed, key=lambda r: r["start_s"]):
+        if merged and p["start_s"] <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], p["end_s"])
+        else:
+            merged.append([p["start_s"], p["end_s"]])
+    alarm_s = sum(_overlap(a, b, r["start_s"], r["end_s"]) for a, b in merged
+                  for r in regions if r["label"] in {"normal", "anomaly"})
+    normal_alarm = sum(_overlap(a, b, r["start_s"], r["end_s"]) for a, b in merged
+                       for r in regions if r["label"] == "normal")
     return {
-        "audio_id": record.audio_id,
-        "device_id": record.device_id,
-        "source_id": record.source_id,
-        "duration_s": record.duration_s,
-        "normal_s": normal_s,
-        "anomaly_s": anomaly_s,
-        "unknown_s": unknown_s,
-        "reviewed_s": reviewed_s,
-        "n_gt_events": len(gt),
-        "n_pred_events": len(pred_events),
-        "n_pred_reviewed": len(reviewed),
-        "n_matched": len(match["matches"]),
-        "n_fp_events": fp_events,
-        "excluded_unknown_events": excluded_unknown,
-        "fp_normal_s": fp_normal_s,
-        "alarm_s": alarm_s,
-        "coverage_inter_s": inter,
-        "gt_duration_s": gt_duration,
-        "boundary_start_errors_s": start_err,
-        "boundary_end_errors_s": end_err,
+        "audio_id": record.audio_id, "device_id": record.device_id, "source_id": record.source_id,
+        "duration_s": record.duration_s, "normal_s": normal_s, "anomaly_s": anomaly_s,
+        "unknown_s": record.duration_s - reviewed_s, "reviewed_s": reviewed_s,
+        "n_gt_events": len(gt), "n_pred_events": len(pred_events), "n_pred_reviewed": len(reviewed),
+        "n_matched": len(matches),
+        "n_fp_events": sum(i not in used_p and p["_ov_n"] > 1e-12 for i, p in enumerate(reviewed)),
+        "excluded_unknown_events": excluded, "fp_normal_s": normal_alarm, "alarm_s": alarm_s,
+        "coverage_inter_s": sum(_overlap(reviewed[i]["start_s"], reviewed[i]["end_s"],
+                                         gt[j]["start_s"], gt[j]["end_s"]) for i, j in matches),
+        "gt_duration_s": sum(g["end_s"] - g["start_s"] for g in gt),
+        "boundary_start_errors_s": [abs(reviewed[i]["start_s"] - gt[j]["start_s"]) for i, j in matches],
+        "boundary_end_errors_s": [abs(reviewed[i]["end_s"] - gt[j]["end_s"]) for i, j in matches],
     }
 
 

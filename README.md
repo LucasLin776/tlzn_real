@@ -1,188 +1,223 @@
-# Wind Audio：风机声音两级异常检测
+# Wind Audio：频谱波动窗口检测＋PANNs 异常识别
 
-本项目面向离线 WAV：先定位可疑声音，再识别异常类型，并用人工审核结果持续改进识别。
-当前实现是**监督式增量学习，不是强化学习**。声音异常不等于机械故障；故障结论仍需人工和工况证据。
+本项目用于风机声音的两级分析：
 
-## 1. 算法架构
+- **L1 不需要训练**：寻找超过阈值的局部频谱波动，输出候选异常的完整时间窗口。
+- **L2 才需要训练**：使用 PANNs 特征和人工审核记录，学习多种异常类型，并通过回放续训。
 
-```text
-原始 WAV
-  │
-  ├─ L1：高召回候选检测
-  │     声学特征 → 正常参考模型 / 有监督对照 → 阈值与事件合并
-  │     输出：起止时间、分数、音频切片、HTML 报告、审核 CSV
-  │
-  └─ L2：候选区间 + 真实上下文
-        32 kHz → 冻结 PANNs CNN14 → 2048 维归一化特征
-        ├─ 正常/异常二分类头
-        ├─ 可扩展的多标签异常类型头
-        ├─ 验证集阈值 + 类原型余弦相似度 → 已知类型 / 疑似正常 / unknown
-        └─ 训练样本记忆库 → 相似案例
-                   │
-             人工确认/修订
-                   │
-         累计审核快照 + 新样本 + 旧样本回放
-                   │
-         批次更新分类头 → 独立评估 → 人工选择新版本
-```
+L1 的目标不是识别所有异常声音，而是定位“频谱从稳定到明显波动”的片段。
+波动前后可以是不同音量、不同频率结构的稳定工况；不要求后半段恢复成前半段的样子。
+候选窗口不等于已确认故障，正常工况切换也可能成为候选。
 
-### L1：定位异常候选
-
-- 主模型 `baseline`：已审核正常声音的 log-mel 中位数/MAD 参考分布，输出异常分数。
-- 对照模型 `supervised`：默认 282 维声学特征 + NumPy 逻辑回归。特征包括当前 mel、谱描述量、上下文统计、多时间尺度左右差。
-- 默认 L1 配置：44.1 kHz、64 mel、0.1 秒目标网格、逐文件归一化；实际配置写入模型。
-- 只使用 train 拟合，val 选择阈值和后处理，test 仅做冻结评估。默认目标事件召回 0.95，不保证实际达到。
-- 未审核区间不当正常，整段粗标不展开为逐帧真值。L1 分数不是故障概率。
-- 已移除“拿当前待测音频安静部分直接拟合”的演示模式，以及 XGBoost/sklearn 自动回退。
-
-### L2：多类型识别与增量学习
-
-编码器采用官方 **32 kHz CNN14** 结构：1024 点 STFT、320 点 hop、64 mel；六个双卷积块的通道为 64/128/256/512/1024/2048，频率平均池化、时间 max+mean 池化、2048 维全连接。
-STFT 和 mel 矩阵直接读取本地检查点里的冻结参数。AudioSet 的 527 类输出层仅为兼容权重保留，不拿它直接当风机故障分类器。
-
-- 默认 4 秒窗口、2 秒步长；短事件读取原音频上下文，边界不足补零；长事件滑窗后平均，再进行 L2 范数归一化。
-- 分类头为 `2048 → 1+K` 的线性层，独立 sigmoid；一段声音可同时属于多种类型。
-- 掩码 BCE：只学习人工确认的正/负标签；未标注类型不自动变成负例。
-- 首次训练使用全部 train。续训默认使用新增/修订的 train 样本和上一版记忆库；旧分类列继承，新类别在类别表末尾追加。
-- 回放按类型保留代表样本，优先覆盖不同来源；默认每类 32 个，另保留正常及无明确类型的异常。记忆库和原型只来源于 train。
-- 默认以 0.5 权重约束回放样本的旧分类输出，减轻遗忘；修订样本不套旧教师标签。训练采用 NumPy Adam，默认 400 轮。
-- 类原型用累计 train 统计，阈值仅从 val 选择。每个输出在 train/val 中的正、负样本均至少覆盖两个独立来源，才启用其决策；这是最低检查门槛，不代表统计充分。
-- 类型判定同时要求分类分数和原型相似度通过门槛；样本不足或不匹配输出 `unknown`。未知拒识是启发式方法，不能保证识别所有新型异常。
-- 返回 `known_anomaly`、`likely_normal` 或 `unknown`，附相似案例；**均保留原 L1 告警供人工审核，不自动删除告警**。
-
-当前只更新分类头、记忆库和原型，**不会更新 PANNs 主干参数**。每次审核可立即存档，但参数按批次更新；不是每审核一条就自动上线。主干微调、在线服务、自动模型发布不在本版范围内。
-
-## 2. 项目布局
+## 1. 架构与算法
 
 ```text
-wind_audio/
-  cli.py                 # 统一命令入口、L1 工作流
-  audio.py               # WAV、重采样与频谱
-  data.py / splits.py    # 清单、标注、来源划分
-  features.py            # L1 特征
-  l1.py / detectors.py   # L1 模型
-  backends.py            # NumPy 有监督对照
-  calibrate.py / evaluate.py
-  events.py              # 事件后处理
-  review.py              # 人工审核、标签修订
-  render.py / report.py   # L1 图表与报告
-  l2/
-    common.py            # JSON、音频/权重身份
-    data.py              # 累计审核快照与标签掩码
-    encoder.py           # PANNs CNN14 与特征缓存
-    model.py             # 分类、回放、蒸馏、校准、评估
-    cli.py               # L2 命令与两级推理
-config/taxonomy.json      # 可编辑的异常类型配置
-docs/ANNOTATION.md        # 数据和人工审核字段规范
-tests/                   # 必要回归测试；夹具仅在临时目录生成
-requirements.txt         # 运行依赖
-pyproject.toml           # 标准 Python 打包与命令入口
-.github/workflows/ci.yml  # 测试、静态检查、构建
+WAV → STFT / Mel 功率谱
+        ↓
+     相邻局部窗口比较 → 频谱变化分数 → 触发候选
+        ↓
+     冻结事件前背景 → 跟踪持续活动与衰减尾部 → 背景恢复/新工况稳定
+        ↓
+     微弱噪声过滤 → 合并短间隔 → 候选完整事件窗口 [start_s, end_s]
+        ├─ 独立窗口 WAV、试听上下文、HTML、审核表
+        └─ L2：原音频＋候选窗口 → 冻结 PANNs CNN14 → 多标签分类
+                                                      ↓
+                           已知类型 / 疑似正常 / unknown＋相似案例
+                                                      ↓
+                           人工审核 → 累计数据 → 分类头回放续训
 ```
 
-`data/`、`weights/`、`models/`、`cache/`、`runs/`、`outputs/`、`reports/` 是本地数据/产物，不随源码发布。
-现有真实录音、人工记录、历史真实模型保留；演示与合成产物不再放在主项目中。
+### L1：频谱波动，而不是固定正常模板
 
-## 3. 环境与依赖
+1. 默认 44.1 kHz、2048 点 FFT、10 ms 帧移、64 Mel，分析 20 Hz–16 kHz。
+2. 每 20 ms 计算一次分数：比较该时刻前后各 0.1 秒的平均 Mel 功率谱。
+3. 对每个频带计算两侧功率的 dB 差，取按局部能量加权的均方根作为变化分数。
+4. 使用共同的局部频谱底限（默认相对峰值 40 dB），降低极弱频带数值抖动；默认约 60 ms 中值平滑抑制孤立噪声。
+5. 双阈值只产生“变化触发种子”，不再把它直接当成完整事件。
+6. 取触发前约 0.6 秒的局部谱中位数作为临时背景，事件期间不更新它。
+   使用相对该背景的正向谱能量差持续跟踪：即使前后谱变化变小，中间持续段和衰减尾部仍可保持活动。
+7. 活动降到释放阈值以下，且连续 0.25 秒没有明显变化，才确认背景恢复；
+   或持续 0.6 秒能量和谱形稳定、并呈现低平坦度谱线/近似原谱形，确认为新稳定工况。
+   结束边界回溯到这段稳定时间的起点，不额外把整段确认延迟加进窗口。
+8. 过滤不显著的独立候选，再合并短间隔，最后仅补各 0.05 秒边界。
+   没有固定“异常最多持续几秒”的截断；直到录音结束仍未恢复时保留到文件尾，并标记结束尚未确认。
+
+分数单位是加权 dB 变化，不是概率。稳定的大声与稳定的小声都可得低分；
+整条录音乘固定增益时，局部比值基本不变；突然的能量跃变仍可触发候选，恢复稳定后分数回落。
+不拟合训练模型，但会测量当前录音的局部背景和相对强度，用于规则判断。
+默认参数是工程起点，尚未通过独立精确标注验证。
+
+### 微弱噪声如何过滤
+
+- 局部显著性：事件期间 Mel 功率谱相对背景的差异比例
+  `sum(abs(P-B)) / sum(P+B)`，峰值需达到默认 0.3，防止微弱频带变化单独报警。
+- 相对强度：在整条录音的最强若干帧（总计约 0.1 秒，不要求连续）中取能量级中位数；
+  候选峰值低于该参考 15 dB 以上时过滤。不是绝对声压标定，整体录音增益变化基本不改变结果。
+- 上述门槛用于事件是否入选，**不会用于切掉已入选事件的弱尾部**；
+  尾部由较低的持续活动释放阈值决定。
+
+调大 `--min-prominence` 或调小 `--relative-floor-db` 可加强过滤；
+反向调整可保留更弱的真实事件。强过滤也会漏掉弱异常，不能把所有被过滤项都认定为噪声。
+整段相对强度参考意味着：同一声音放在不同响度组成的录音里，入选结果可能不同；
+它适用于当前离线筛查，不是跨设备已标定的故障阈值。
+
+默认忽略依赖边缘补齐的 FFT 帧，避免文件首尾伪变化。极短音频没有完整 FFT 帧时输出零分；
+录音开始就已经存在且持续稳定的异音，不能靠本方法判断其是否异常。
+这是离线分析，使用右侧窗口和居中滤波，不是已实现的实时流式服务。
+
+### 窗口是 L1 的核心输出
+
+每个事件明确区分：
+
+| 字段/文件 | 含义 |
+|---|---|
+| triggers、trigger_start_s / trigger_end_s | 窗口内各变化种子，以及首尾触发范围；不是完整事件边界 |
+| start_s / end_s / duration_s | 跟踪持续段和尾部后的窗口，L2 和审核模板使用此范围 |
+| boundary_reason | background_return / new_stable_state / end_of_file，解释结束依据 |
+| right_censored | true 表示到文件末尾仍未确认结束，不代表事件恰好在那里结束 |
+| windows/*.wav | 检测窗口本身，不带额外试听上下文 |
+| clips/*.wav、clip.start_s/end_s | 默认额外前后各 1 秒，便于听取，不是异常真值 |
+| scores.csv、activity.png | 分开记录/绘制变化触发分数、持续活动分数、显著性、能量和最终窗口状态 |
+| diagnostics.rejected_candidates | 被过滤候选及原因；不进入 L2 或审核表，不是假定正常标签 |
+| l1_config.json | 本次实际使用的全部 L1 参数 |
+
+所有时间相对于原录音；窗口裁剪到文件范围内，补充后重叠的窗口会合并。
+连续活动期间多个触发属于同一事件；两个完整事件间安静间隔不超过 merge_gap 时再合并。
+不会用一个峰值代替异常窗口；只有没找到结束依据时才保留到文件末尾并标记。
+
+20 ms 是输出网格，不代表 20 ms 的真实边界精度：FFT、比较窗口、平滑和边界补充都会带来时间扩展。
+边界需要精确时，人工修订 corrected_start_s/end_s；不能声称默认参数能保证覆盖每一个异常。
+
+### L2：保留人工审核增量学习
+
+- 本地官方 32 kHz PANNs CNN14：STFT 1024 / hop 320 / 64 Mel，六个双卷积块，输出 2048 维特征。
+- 默认 4 秒上下文、2 秒滑动步长；读取原音频，短事件补真实上下文，边缘不足补零；长事件滑窗平均后归一化。
+- 冻结 CNN14，训练线性 sigmoid 分类头：一个正常/异常输出＋K 个可并存的异常类型。
+- 掩码 BCE 只使用已确认正负标签；旧类别可回放，新类别末尾追加；可选旧输出蒸馏、原型相似度拒识和相似案例检索。
+- 主干不随审核更新；参数按批次更新，不是每审核一条就自动训练或上线。
+- 每个输出在 train/val 正负例中至少各覆盖两个来源才启用决策。该门槛不等于统计充分。
+- 输出 known_anomaly / likely_normal / unknown，均保留原 L1 告警供人工审核。
+- L2 内部的 4 秒编码上下文不会改写 L1 的检测窗口或自动变成人工标签。
+
+## 2. 环境与直接运行
 
 使用你的环境：
 
 ```bash
 conda activate post_training
 cd /Users/shuoqinlin/Desktop/wind_audio
-python -m wind_audio --help
+
+# 不需要模型目录、不需要标注、不需要先训练
+python -m wind_audio run \
+  --input data/anomaly/A01_01_20261030_120227.wav \
+  --out runs/l1_spectral_check
 ```
 
-`requirements.txt`：
+默认参数来自内置配置，仓库提供同值的 config/l1.json 便于编辑：
 
+```bash
+python -m wind_audio run \
+  --input data/anomaly/A01_01_20261030_120227.wav \
+  --config config/l1.json --threshold 6 \
+  --out runs/l1_threshold6
+```
+
+input 可为一个 WAV 或目录。每次请选择新输出目录，已有审核记录的目录不覆盖。
+目录输入生成 `index.html` 总览和 `summary.json`，各录音分别保存报告、窗口和审核表：
+
+```bash
+python -m wind_audio run \
+  --input /Users/shuoqinlin/Desktop/异常 \
+  --config config/l1.json --out runs/batch_event_windows
+```
+
+| 参数 | 默认值 | 作用 |
+|---|---:|---|
+| --threshold | 6 | 变化分数进入阈值，越高越不敏感 |
+| --low-ratio | 0.6 | 仅变化触发种子的低阈值比例 |
+| --compare-s | 0.1 秒 | 前后各比较多长的谱窗口 |
+| --smooth-s | 0.06 秒 | 分数中值平滑时间 |
+| --target-step | 0.02 秒 | 输出网格间隔 |
+| --min-dur | 0.06 秒 | 合并后跟踪事件的最短持续时间，在边界补充前检查 |
+| --merge-gap | 0.35 秒 | 完整事件之间的合并间隔 |
+| --padding | 0.05 秒 | 检测窗口每端额外覆盖范围 |
+| --clip-context | 1 秒 | 仅试听切片每端额外上下文 |
+| --reference-s | 0.6 秒 | 事件前背景谱长度 |
+| --release-db | 3 | 相对背景的正向谱差释放阈值，越低尾部越长 |
+| --quiet-s | 0.25 秒 | 确认背景恢复所需连续安静时间 |
+| --settle-s | 0.6 秒 | 确认新稳定工况所需时间 |
+| --stability-db | 1.5 | 新工况能量/归一化谱形稳定容差 |
+| --min-prominence | 0.3 | 与背景的能量差异比例下限，越高过滤越强 |
+| --relative-floor-db | 15 | 容许比录音强声参考低多少 dB，越小过滤越强 |
+
+配置版本为 `spectral_event_v2`；0.4 的 `spectral_change_v1` 配置拒绝加载，避免静默混用。
+旧报告仍可查看；需用新配置重新生成新目录，旧人工审核不会自动转成新边界。
+
+L1 只需 NumPy；完整 L2 还需 PyTorch。requirements.txt：
 ```text
 numpy>=1.24,<3
 torch>=2.6,<3
 ```
 
-本次没有安装任何库或下载权重。如需安装，由你手动执行：
+本次没有安装任何依赖或下载权重。你可自行安装；从仓库目录用 python -m wind_audio 无需安装本项目。
+L2 请自行准备可信来源的官方 CNN14 检查点，例如 weights/Cnn14_mAP=0.431.pth；
+不会自动下载，也不需要 xgboost、sklearn、torchaudio、librosa 或 torchlibrosa。
+上游：[PANNs](https://github.com/qiuqiangkong/audioset_tagging_cnn) · [论文](https://arxiv.org/abs/1912.10211)。
+
+## 3. 用你的标注检验 L1 窗口
+
+标注数据的主要用途是检查漏检、误检和窗口边界，不是训练 L1。
+精确标注格式见 [标注规范](docs/ANNOTATION.md)；完整审核的录音可把未标异常的部分视为正常，
+未完整审核则保留 unknown。整段“有异常”的粗标不能当成整段都是精确异常窗口。
 
 ```bash
-python -m pip install -r requirements.txt
-# 可选：安装项目命令 wind-audio；在项目目录中用 python -m wind_audio 则无需此步
-python -m pip install -e . --no-deps
-```
-
-不依赖 xgboost、scikit-learn、torchaudio、librosa、torchlibrosa 或 panns-inference。
-本机检查到 `post_training` 为 Python 3.11，NumPy 和 PyTorch 可用；当前无 CUDA/MPS，可先用 `--device cpu`。
-
-请自行准备可信来源的官方 CNN14 检查点，放在例如 `weights/Cnn14_mAP=0.431.pth`。
-只支持本地、32 kHz CNN14，支持官方 `{"model": state_dict}` 格式；不支持随意替换 CNN6、Wavegram 或不同前端配置。
-程序不联网下载，加载使用 `weights_only=True`。更换权重、窗口或步长后须重提特征，不能直接继续旧模型训练。
-
-上游：[PANNs 实现](https://github.com/qiuqiangkong/audioset_tagging_cnn) · [论文](https://arxiv.org/abs/1912.10211)。
-上游权重及实现的使用条件按其原项目执行；本仓库尚未替你选择开源许可证。
-
-## 4. 数据准备
-
-先看 [标注规范](docs/ANNOTATION.md)。至少准备：
-
-1. `data/manifest.csv`：音频 ID、路径、原录音/批次 `source_id`。
-2. `data/annotations.csv`：L1 已审核正常/异常区间。
-3. `data/splits.json`：按来源固定 train/val/test。
-4. `config/taxonomy.json`：真实需要识别的声音类型。当前提供冲击、摩擦、窄带异音三个可修改配置项，不是已训练类别，也不表示故障原因。
-
-同一原录音裁剪出的片段必须属于同一来源、同一集合。若评估跨设备泛化，用 `--group-by device`，并在清单中填写设备 ID。L2 还会检查同一音频内容不能跨集合。
-
-```bash
-python -m wind_audio check --manifest data/manifest.csv --annotations data/annotations.csv
-
-# 首次建立划分，增量阶段不要重跑随机划分
-python -m wind_audio split \
-  --manifest data/manifest.csv --annotations data/annotations.csv \
-  --group-by source --out data/splits.json
-```
-
-目前仓库中的真实数据只有一条约 30 秒、整段粗标异常的录音，没有足够独立来源、精确异常区间和已审核正常样本，**不能据此完成正式训练/校准/测试**。下列命令是在补齐数据之后的完整运行方式，不是已取得的模型成绩。
-
-## 5. L1 训练、推理与审核
-
-```bash
-python -m wind_audio train \
-  --manifest data/manifest.csv --annotations data/annotations.csv --splits data/splits.json \
-  --detector baseline --version l1_v1 --out models/l1_v1 --target-recall 0.95
-
 python -m wind_audio evaluate \
-  --model models/l1_v1 --manifest data/manifest.csv --annotations data/annotations.csv \
-  --splits data/splits.json --split test --out reports/l1_v1_test
-
-python -m wind_audio run \
-  --input data/anomaly/A01_01_20261030_120227.wav --model models/l1_v1 \
-  --manifest data/manifest.csv --annotations data/annotations.csv --out runs/recording_v1
+  --manifest data/manifest.csv --annotations data/annotations.csv \
+  --config config/l1.json --out reports/l1_check
 ```
 
-运行目录输出 `events.json`、`report.html`、图表、音频切片和 `review.csv`。
-请每次使用新输出目录；已有审核 CSV 的目录不会被推理覆盖。
-检查模型的 `calibrated` 和 `calibration.json` 的 `target_reached`；校准失败或召回目标未达到不能当作验收通过。
+不需要 train/val/test 划分，一条精确标注录音也能检验。
+有固定独立评估集时可加 --splits data/splits.json --split test。
+检查输出的事件召回、精确率、每小时误报、异常覆盖率、边界误差和正常区报警时长。
 
-人工听取后填写 `review.csv`：
+评估使用连续标注区间，不再把短事件压到 0.1 秒网格；
+只计入已审核区间，IoU 分母排除未知时长，并按一对一事件匹配。
+已匹配窗口中超出真实异常、落在正常区的部分也计入正常区报警时长。
+默认匹配 IoU=0.1 较宽松，可用 --match-iou 提高；不能仅看召回忽略边界过宽。
 
-- `l1_label`：normal / anomaly / uncertain。
-- `positive_types`：已确认类型 ID，多个用分号，例如 `impact;friction`。
-- `negative_types`：明确排除的类型；不知道就留空。
-- `types_complete`：只有完整审核当前类型表后才填 true，否则 false。
-- `corrected_start_s/end_s`：必要时修正边界。
-- `l2_label`、`fault_type`：保留人工故障结论，不由类型模型擅自填真值。
+阈值可手动调整：先在开发录音中检查，再冻结配置，在未参与调参的录音上报告正式指标。
+没有自动阈值训练，也不会把待检录音拟合成正常参考。
+当前现存录音只有整段粗标，能直接检测窗口，但不能据此给出真实召回率或边界精度。
+
+## 4. 人工审核
+
+打开 run 输出的 report.html，对每个候选窗口听取并修订 review.csv：
+
+- l1_label：normal / anomaly / uncertain。
+- corrected_start_s / corrected_end_s：必要时修订检测边界。
+- positive_types / negative_types：已确认/排除的类型 ID，多个用分号分隔。
+- types_complete：只有已审查当前全部类型时才填 true。
+- l2_label / fault_type：独立的人工故障结论，不把异常声音直接等同于故障。
 
 ```bash
 python -m wind_audio review-import \
-  --review runs/recording_v1/review.csv --out data/reviews/reviews.csv
+  --review runs/l1_spectral_check/review.csv --out data/reviews/reviews.csv
 ```
 
-导入会记录审核时间，并在已有事件的训练标签改变时递增 `review_revision`。
-模型预测不会自动转成人工标签。待审/不确定记录不进入训练。
-`anomaly + nonfault` 依然是异常正例；只有人工确认 normal 才是正常样本。
+预测不自动写成人工真值。anomaly + nonfault 仍是异常；uncertain/待审不进入 L2 训练。
+导入会补审核时间，已有事件的训练标签发生改变时递增 review_revision。
+检查无告警区域也很重要：L1 漏掉的事件不会自动出现在 L2 数据中。
 
-## 6. L2 首次训练
+## 5. L2 首次训练与续训
 
-先收集 train、val、test 都有覆盖的人工审核记录，再运行：
+以下只适用于 L2；L1 无此训练步骤。
+准备 manifest、累计 reviews 和 config/taxonomy.json，按原始录音/采集来源固定划分：
 
 ```bash
+python -m wind_audio split \
+  --manifest data/manifest.csv --annotations data/annotations.csv \
+  --group-by source --out data/splits.json
+
 python -m wind_audio l2-prepare \
   --reviews data/reviews/reviews.csv --manifest data/manifest.csv --splits data/splits.json \
   --taxonomy config/taxonomy.json --out data/l2/v1.json
@@ -195,23 +230,14 @@ python -m wind_audio l2-embed \
 
 python -m wind_audio l2-train \
   --dataset data/l2/v1.json --features cache/l2_v1.npz \
-  --out models/l2_v1 --version l2_v1
+  --version l2_v1 --out models/l2_v1
 
 python -m wind_audio l2-evaluate \
   --model models/l2_v1 --dataset data/l2/v1.json --features cache/l2_v1.npz \
   --split test --out reports/l2_v1_test.json
 ```
 
-模型目录保存 `meta.json`、`model.npz`、`validation.json`：类别顺序、编码器身份、分类参数、阈值、训练来源与回放样本均随版本记录。
-数据快照、特征、评估文件和 L2 模型输出默认不覆盖旧文件；请选择新版本路径。
-
-## 7. 增量学习与新增类型
-
-1. 新事件先人工审核，合并进入累计 `reviews.csv`。
-2. 新音频加入 manifest 和 splits；保持旧来源的集合归属，不把旧 val/test 移到 train。
-3. 新类型只在 taxonomy 的末尾追加稳定 ID，不删除、不重排旧 ID。
-4. 使用 `--previous` 保留旧审核当时覆盖的类别范围；旧记录的“完整审核”不会自动否定后来新增的类型。
-5. 重新提取累计特征，再用 `--resume` 续训。
+新审核导入后，保持旧来源划分，新类别仅在 taxonomy 末尾追加：
 
 ```bash
 python -m wind_audio l2-prepare \
@@ -223,78 +249,90 @@ python -m wind_audio l2-embed \
   --out cache/l2_v2.npz --device cpu
 
 python -m wind_audio l2-train \
-  --dataset data/l2/v2.json --features cache/l2_v2.npz \
-  --resume models/l2_v1 --out models/l2_v2 --version l2_v2
+  --dataset data/l2/v2.json --features cache/l2_v2.npz --resume models/l2_v1 \
+  --version l2_v2 --out models/l2_v2
 ```
 
-本版要求保留累计数据快照和历史原音频，尚未实现仅依赖固定记忆库的流式存储。
-旧训练标签可修订，但版本必须递增；已用于训练的事件边界变化、删除历史样本、改保留集标签，需要重建明确的数据基准并从头训练，不能静默续训。
+--previous 保留旧审核时覆盖的类别范围；旧完整审核不会自动把新类型当负例。
+模型保存分类头、类别顺序、训练来源、原型、阈值和记忆库；默认不覆盖旧输出。
+默认续训用新/修订样本＋每类最多 32 个回放代表样本，支持正负标签掩码和旧输出蒸馏。
+仍需累计快照和历史音频；不允许把旧测试来源移入训练。
+旧边界/保留集标签需修订时应重建明确的数据基准，从头训练分类头，不能静默续训。
+用独立保留集比较后显式选择新模型，不自动替换上线。
 
-新类型需要独立 val 正/负例，否则该输出保持 inactive/unknown。
-在相同冻结保留集上比较旧类型 F1、异常保留率与新增类型识别；不能仅看总体准确率。
-开发阶段优先比较 val，正式 test 不用于反复挑版本。上线由你通过 `--model` / `--l2-model` 显式指定，不自动替换旧模型。
-
-## 8. 两级推理
+## 6. 两级推理
 
 ```bash
 python -m wind_audio pipeline \
   --input data/anomaly/A01_01_20261030_120227.wav \
-  --l1-model models/l1_v1 --l2-model models/l2_v2 \
+  --l1-config config/l1.json --l2-model models/l2_v2 \
   --checkpoint weights/Cnn14_mAP=0.431.pth --device cpu --out runs/two_stage_v2
 ```
 
-- `runs/two_stage_v2/l1/report.html`：L1 时间定位、波形、频谱与切片。
-- `runs/two_stage_v2/events.json`：两级联合结果，每个事件的 `l2` 含状态、类型、分数、相似案例。
-- `runs/two_stage_v2/l1/review.csv`：继续人工审核，预测不会代填真值。
-
-对已经生成的 L1 结果也可单独运行：
+--l1-config 可省略，--l1-threshold 可覆盖阈值；不再需要 --l1-model。
+pipeline 接受单条 WAV；批量先 run，再逐份 l2-run：
 
 ```bash
 python -m wind_audio l2-run \
-  --events runs/recording_v1/events.json --model models/l2_v2 \
-  --checkpoint weights/Cnn14_mAP=0.431.pth --device cpu \
-  --out runs/recording_v1/events_l2.json
+  --events runs/l1_spectral_check/events.json --model models/l2_v2 \
+  --checkpoint weights/Cnn14_mAP=0.431.pth --out runs/l1_spectral_check/events_l2.json
 ```
 
-`run` 支持目录批量处理；`pipeline` 当前接收单条 WAV。联合结果目前为 JSON，HTML 仍是 L1 报告。
+L2 使用 events 的 start_s/end_s，不使用带额外试听上下文的 clip.start_s/end_s。
+联合结果为 JSON；HTML 展示 L1 窗口，审核表仍由人工填写。
 
-## 9. 已实现的对照实验
+## 7. 对照与验证
 
-所有对照应共享来源划分、标签和评估口径。以下是可运行的配置，不是已测出的结论。
+L1 不再比较逻辑回归/XGBoost等训练模型；可在同一检验集比较：
+固定阈值、比较窗宽、释放阈值、稳定确认时间、噪声过滤和合并间隔的影响。
+对照阈值必须在开发集选定，不能把反复调整后的测试结果当独立成绩。
 
-| 对照 | 设置 |
-|---|---|
-| L1 正常参考模型 | `train --detector baseline` |
-| L1 有监督基线 | `train --detector supervised`，同一数据参数 |
-| L2 静态模型 | 冻结首次训练的 `l2_v1`，不执行续训 |
-| L2 朴素增量 | `l2-train --resume ... --no-replay --distill 0` |
-| L2 回放、不蒸馏 | `l2-train --resume ... --distill 0` |
-| L2 回放＋蒸馏 | 默认续训配置 |
-| L2 累计全量重训 | `l2-train --resume ... --full-retrain`，分类头重新初始化 |
-
-完整命令均需提供 dataset/features/version/out；每个实验使用独立输出目录。
-“无回放”只消融分类头的历史样本训练，类原型仍从累计 train 统计。上述对照都冻结 PANNs，不包含主干微调对照。
-
-L1 输出事件召回、精确率、每小时误报；L2 输出逐类型 P/R/F1、macro-F1、疑似正常拒绝率、建议异常保留率和未知拒识召回。
-L2 指标只针对已审核候选，**不是端到端召回**。L1 没报出的异常不会自动进入 L2，必须定期抽查未告警音频并补充漏检标注。
-未知拒识指标只覆盖已确认类型全部未被启用的异常；无类型真值时不能据此估计未知检出能力。
-
-## 10. 验证、工程边界与发布
+L2 保留：静态模型、朴素增量（--no-replay --distill 0）、仅回放（--distill 0）、
+默认回放＋蒸馏、累计从头重训（--full-retrain）。
+这些消融都冻结 PANNs；无回放只消融分类头历史训练，原型仍由累计 train 统计。
+L2 指标是已审核候选上的条件指标，不是整个系统的端到端召回。
 
 ```bash
 python -m unittest discover -s tests -t . -v
-# 可选的大模型结构测试：只生成本地临时随机/零权重，不下载预训练权重
 WIND_AUDIO_TEST_PANNS=1 python -m unittest tests.test_l2.PannsStructureTests -v
 ```
 
-保留回归测试，移除了独立合成演示工程和产物。CI 使用 Python 3.11，执行测试、静态检查和打包。
-提交前检查 `git status`；忽略规则不会自动清除过去已跟踪的数据。不要提交真实录音、审核隐私、训练权重或本地缓存。没有自动提交、推送或选择许可证。
+必要回归包括：水平谱线＋背景噪声不持续触发、幅值切换后恢复、频率变化定位、
+冲击窗口覆盖、长持续段不退化成两条边缘、尾部覆盖、弱扰动过滤、相邻与独立事件、
+窗口 WAV 时长、长文件名切片不碰撞、批量报告、L2 接收正确边界。
+测试临时信号不代表真实风机性能；CNN14 结构测试不下载预训练权重。
+
+## 8. 工程布局和边界
+
+```text
+wind_audio/
+  l1.py                    # 无需训练的局部频谱变化评分
+  features.py              # 频谱与配置，不再生成 282 维分类特征
+  windowing.py             # 局部背景冻结、事件跟踪、稳定结束、微弱噪声过滤
+  detectors.py             # 跟踪窗口、合并、边界补充、配置加载
+  cli.py                   # run / evaluate / review / L2 命令入口
+  audio.py / events.py      # 音频处理、事件后处理与描述
+  data.py / splits.py       # 标注检验与 L2 来源划分
+  evaluate.py               # 连续时间窗口评估
+  review.py / report.py / render.py
+  l2/                      # PANNs、审核快照、回放分类训练与推理
+config/l1.json             # L1 参数，不是训练模型
+config/taxonomy.json       # L2 类型表，配置项不表示已训练成功
+docs/ANNOTATION.md
+tests/
+requirements.txt / pyproject.toml / .github/workflows/ci.yml
+```
+
+旧 L1 train/calibrate、baseline/supervised 和 --model/--l1-model 入口已移除，避免混用不同目标；
+历史模型、原始录音、审核记录和已有报告保留在原处，不修改 Git 历史。
 
 仍需注意：
 
-- 当前尚无真实 PANNs 预训练权重下的风机效果验证，也没有足够真实标注支撑性能结论。
-- L1 评估在部分审核区间、跨 unknown 预测、极短事件和正常区误报时长上仍有旧版计量限制；正式验收优先使用完整精确审核录音，不能将现有报表当最终工业指标。
-- L1 逐文件归一化可能削弱持续异常；完整录音上下文不是低延迟流式实现。
-- 目前全文件读取、特征矩阵驻留内存，长录音/大数据需按独立录音合理分批，不能打乱来源分组。
-- WAV 支持 8/16/32 位整数 PCM，不支持 24 位/浮点 WAV；多声道平均可能抵消反相信号。
-- 增量学习不保证每次性能上升；新版本若旧类退化，应保留旧版并补数据/调整训练，而不是自动部署。
+- 稳定异常音调、过慢变化、过短冲击、文件边缘缺乏上下文的事件可能漏检。
+- “新稳定工况”是启发式判断，持续稳定的异常谱线也可能被当成新工况；需要 L2/人工区分。
+- 相对强度过滤可能压掉弱真实异常；批量窗口数不等于准确率，过滤数量不等于已证实误报。
+- 工况切换和环境冲击也可触发候选，是否异常需 L2/人工确认。
+- 本版全文件离线分析，未实现流式处理；大录音需注意内存。
+- WAV 支持 8/16/32 位整数 PCM，不支持 24 位或浮点 WAV；多声道平均可能抵消信号。
+- 数据、权重、审核隐私和产物不应上传；.gitignore 不会取消过去的跟踪。
+- 没有选择许可证、安装库、下载权重、提交或推送。真实效果需独立标注验证。

@@ -108,10 +108,6 @@ def write_report(
     score_type: str,
     threshold: float,
     threshold_source: str,
-    calibrated: bool,
-    calibration: dict | None,
-    demo: bool,
-    backend: dict | None,
     feature_config: dict,
     postprocess: dict,
     events: list[dict],
@@ -133,17 +129,21 @@ def write_report(
             if clip.get("path")
             else "-"
         )
+        window_path = (ev.get("window") or {}).get("path", "")
+        window_link = f'<a href="{html.escape(window_path)}">检测窗口 WAV</a>' if window_path else "-"
+        boundary = {"background_return": "背景恢复", "new_stable_state": "新工况稳定",
+                    "end_of_file": "到文件末尾，结束未确认"}.get(ev.get("boundary_reason"), "-")
         event_rows.append(
             "<tr>"
             f"<td>{i}</td>"
             f"<td>{_fmt(ev['start_s'])} – {_fmt(ev['end_s'])}</td>"
             f"<td>{_fmt(ev['duration_s'])}</td>"
             f"<td>{_fmt(ev['peak_score'], 3)}</td>"
-            f"<td>{html.escape(str(ev.get('score_type', score_type)))}</td>"
+            f"<td>{html.escape(boundary)}</td>"
             f"<td>{html.escape(_match_label(ev, gt_events))}</td>"
             f"<td>{html.escape(str((reviews or {}).get(ev.get('event_id'), {}).get('l1_label') or '待审核'))}</td>"
             f"<td>{html.escape(str((reviews or {}).get(ev.get('event_id'), {}).get('l2_label') or 'not_trained'))}</td>"
-            f"<td>{player}</td>"
+            f"<td>{window_link}<br>{player}</td>"
             "</tr>"
         )
     event_table = "\n".join(event_rows) if event_rows else '<tr><td colspan="9">未检测到事件</td></tr>'
@@ -162,32 +162,13 @@ def write_report(
         )
     region_table = "\n".join(region_rows) if region_rows else '<tr><td colspan="4">无标注</td></tr>'
 
-    if demo:
-        banner = (
-            '<div class="warn"><b>演示模型</b>：该模型用待检测录音的安静段拟合，'
-            "这些帧不一定是正常样本。结果只用于验证链路，<b>不能当作真值、召回率或生产结论</b>。</div>"
-        )
-    elif not calibrated:
-        banner = (
-            '<div class="warn"><b>未校准</b>：阈值没有在验证集上按目标召回选取，'
-            "报告中的报警数量不代表生产性能。</div>"
-        )
-    else:
-        cal = calibration or {}
-        banner = (
-            f'<div class="ok"><b>已校准</b>：验证集目标召回 {_fmt(cal.get("target_recall"), 2)}，'
-            f'目标{"达到" if cal.get("target_reached") else "未达到"}；'
-            f'验证集实际召回 {_fmt((cal.get("validation") or {}).get("event_recall"), 3)}。</div>'
-        )
-    backend_note = ""
-    if backend and backend.get("used"):
-        backend_note = (
-            f'<div class="ok">分类器：<code>{html.escape(str(backend["used"]))}</code>；'
-            "分数不代表机械故障概率。</div>"
-        )
-
+    banner = (
+        '<div class="ok"><b>完整事件跟踪＋微弱噪声过滤（无需训练）</b>：变化触发后，'
+        '继续跟踪持续段和衰减尾部，不以边缘分数回落作为结束。候选不等于已确认故障；'
+        '稳定新工况可结束事件，无需恢复旧幅值。边界和过滤门槛仍需人工检验。</div>'
+    )
     total_alarm = sum(ev["duration_s"] for ev in events)
-    threshold_unit = "z" if score_type == "baseline_z" else "score"
+    threshold_unit = "dB change"
     y_wave = [(0.0, "+1"), (50.0, "0"), (100.0, "−1")]
     y_spec = [(0.0, _fmt(analyzed_fmax / 1000, 1) + "k"), (25.0, _fmt(analyzed_fmax * 0.75 / 1000, 1) + "k"),
               (50.0, _fmt(analyzed_fmax / 2 / 1000, 1) + "k"), (75.0, _fmt(analyzed_fmax * 0.25 / 1000, 1) + "k"),
@@ -196,12 +177,16 @@ def write_report(
         f"sr={feature_config.get('sr')} · n_fft={feature_config.get('n_fft')} · "
         f"hop={feature_config.get('hop')} · n_mels={feature_config.get('n_mels')} · "
         f"fmin={feature_config.get('fmin')} · fmax={feature_config.get('fmax')} · "
-        f"target_step={feature_config.get('target_step')}s · context=±{feature_config.get('context_s')}s · "
-        f"normalize={feature_config.get('normalize')}"
+        f"target_step={feature_config.get('target_step')}s · compare={feature_config.get('compare_s')}s · "
+        f"smooth={feature_config.get('smooth_s')}s"
     )
     post_txt = (
         f"min_duration={postprocess.get('min_duration')}s · merge_gap={postprocess.get('merge_gap')}s · "
-        f"low_ratio={postprocess.get('low_ratio')}"
+        f"low_ratio={postprocess.get('low_ratio')} · padding={postprocess.get('padding')}s · "
+        f"reference={postprocess.get('reference_s')}s · release={postprocess.get('release_db')}dB · "
+        f"quiet={postprocess.get('quiet_s')}s · settle={postprocess.get('settle_s')}s · "
+        f"stability={postprocess.get('stability_db')}dB · prominence={postprocess.get('min_prominence')} · "
+        f"relative_floor={postprocess.get('relative_floor_db')}dB"
     )
     review_html = (
         f'<p class="note">审核模板：<a href="{html.escape(review_relpath)}">{html.escape(review_relpath)}</a>'
@@ -212,7 +197,7 @@ def write_report(
 
     doc = f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>L1 异常检测报告 · {html.escape(file_name)}</title>
+<title>L1 频谱波动窗口报告 · {html.escape(file_name)}</title>
 <style>
   :root {{ --ink:#1b2430; --muted:#66707d; --line:#e2e6eb; --bg:#f5f7f9; --accent:#1f4e8c; }}
   * {{ box-sizing:border-box; }}
@@ -253,7 +238,7 @@ def write_report(
   <h1>L1 异常检测报告</h1>
   <div class="sub">{html.escape(file_name)} · 音频 ID <code>{html.escape(audio_id)}</code> ·
     真实时长 {duration:.3f}s · 采样率 {sr} Hz · 分析频段 0–{analyzed_fmax:.0f} Hz</div>
-  {banner}{backend_note}
+  {banner}
   <div class="card"><div class="grid">
     <div class="kpi"><div class="v">{len(events)}</div><div class="l">报警事件</div></div>
     <div class="kpi"><div class="v">{total_alarm:.2f}s</div><div class="l">报警总时长</div></div>
@@ -269,17 +254,18 @@ def write_report(
 
   <div class="card">
     {_plot_block(waveform_name, "波形（时间轴：秒；含人工标注明暗）", "绿色=已审核正常，红色=已审核异常，灰色=未审核；橙色框=模型事件。", duration, y_labels=y_wave)}
-    {_plot_block(spectrogram_name, "时频图（时间轴：秒；线性频率，低频在下）", "顶部 7px 色带为人工标注；橙色竖线=模型事件。颜色越亮能量越强。", duration, y_labels=y_spec)}
-    {_plot_block(score_name, "模型分数与阈值（时间轴：秒）", f"红色虚线=阈值 {_fmt(threshold, 4)}；浅色底=人工标注区域；橙色框=报警事件。", duration)}
+    {_plot_block(spectrogram_name, "时频图（时间轴：秒；线性频率，低频在下）", "橙色完整矩形=候选事件窗口（持续段＋尾部）；顶部色带为人工标注。颜色越亮能量越强。", duration, y_labels=y_spec)}
+    {_plot_block(score_name, "边缘触发分数（不是事件持续分数）", f"红色虚线=触发阈值 {_fmt(threshold, 4)}；分数回落不代表事件结束。", duration)}
+    {_plot_block("activity.png", "相对事件前背景的持续活动分数", f"红线=释放阈值 {_fmt(postprocess.get('release_db'), 2)} dB；需连续安静或新工况稳定才结束。过滤掉的候选可能仍有曲线，但没有事件框。", duration)}
   </div>
 
   <div class="card">
-    <div class="plot-title">报警事件</div>
+    <div class="plot-title">候选异常窗口</div>
     <table><thead><tr>
-      <th>#</th><th>起止 (s)</th><th>时长 (s)</th><th>峰值分数</th><th>分数类型</th>
+      <th>#</th><th>起止 (s)</th><th>时长 (s)</th><th>触发峰值</th><th>结束依据</th>
       <th>与人工标注</th><th>L1 人工</th><th>L2 人工</th><th>试听（含上下文）</th>
     </tr></thead><tbody>{event_table}</tbody></table>
-    <p class="note">分数是检测分数，不是故障概率；{html.escape(score_type)} 未做概率校准。
+    <p class="note">触发分数与持续活动分数不同，均不是概率。检测窗口 WAV 不含额外试听上下文。
     事件特征同时写入 <code>events.csv</code> / <code>events.json</code>，供 L2 使用。</p>
     {review_html}
   </div>
@@ -288,7 +274,7 @@ def write_report(
     <div class="plot-title">人工标注区间</div>
     <table><thead><tr><th>标签</th><th>起止 (s)</th><th>时长 (s)</th><th>状态</th></tr></thead>
     <tbody>{region_table}</tbody></table>
-    <p class="note">未审核区域不参与训练、阈值校准和评估；文件级粗标不会展开成逐帧真值。</p>
+    <p class="note">L1 不需要训练。标注仅用于检验窗口；未审核区域不当正常，整段粗标不展开成精确真值。</p>
   </div>
 
   <div class="card"><details><summary>模型、特征与后处理参数</summary>
@@ -296,12 +282,53 @@ def write_report(
       分数类型 <code>{html.escape(score_type)}</code> · 阈值 {_fmt(threshold, 4)}（来源 {html.escape(threshold_source)}）</p>
     <p class="note">特征：{html.escape(cfg_txt)}</p>
     <p class="note">后处理：{html.escape(post_txt)}</p>
-    <p class="note">校准：{html.escape(str(calibrated))}；demo：{html.escape(str(demo))}；
-      后端：{html.escape(str((backend or {}).get("used", "baseline")))}</p>
-    <p class="note">本报告只说明“声音是否异常”，不判断机械故障类型；L2 未训练时统一为“待审核/未训练”。</p>
+    <p class="note">逐时刻触发、活动、显著性、能量和窗口状态见 <a href="scores.csv">scores.csv</a>。
+    <a href="events.json">events.json</a> 保留过滤原因；相对能量过滤可能漏掉较弱的真实异常。</p>
+    <p class="note">本报告只定位“明显频谱波动”，不确认异常或机械故障类型；L2 未训练时统一为“待审核/未训练”。</p>
   </details></div>
 </div></body></html>
 """
     path = out / "report.html"
     path.write_text(doc, encoding="utf-8")
     return path
+
+
+def write_batch_report(out_dir, summary):
+    """Portable overview; all report links are relative to the batch directory."""
+    from urllib.parse import quote
+    out = Path(out_dir)
+    rows = []
+    for item in summary["files"]:
+        relative = Path(item["report"]).resolve().relative_to(out.resolve()).as_posix()
+        windows = "；".join(f'{w["start_s"]:.2f}–{w["end_s"]:.2f}'
+                            + ("（末尾未结束）" if w["right_censored"] else "")
+                            for w in item["windows"]) or "无"
+        rows.append(
+            f'<tr><td><a href="{quote(relative)}">{html.escape(item["file"])}</a></td>'
+            f'<td>{item["duration_s"]:.2f}</td><td>{item["events"]}</td>'
+            f'<td>{item["alarm_s"]:.2f}</td><td>{item["filtered_candidates"]}</td>'
+            f'<td>{html.escape(windows)}</td></tr>')
+    failures = "".join(f'<li>{html.escape(f["file"])}：{html.escape(f["error"])}</li>'
+                       for f in summary["failures"])
+    cfg = html.escape(__import__("json").dumps(summary["detector_config"], ensure_ascii=False, indent=2))
+    body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<title>L1 完整事件窗口 · 批量测试</title>
+<style>body{{max-width:1400px;margin:30px auto;padding:0 20px;color:#243347;
+font:15px/1.65 system-ui,sans-serif;background:#f6f8fb}}table{{border-collapse:collapse;width:100%;background:white}}
+td,th{{padding:10px;border-bottom:1px solid #dce2eb;text-align:left}}td:first-child{{max-width:360px;overflow-wrap:anywhere}}
+a{{color:#2056a3}}.note{{background:#fff4da;padding:14px;border-radius:8px}}pre{{overflow:auto}}</style>
+<h1>L1 完整事件窗口 · 批量测试</h1>
+<p>成功 {summary["files_succeeded"]}/{summary["files_requested"]} 条；
+录音共 {summary["total_duration_s"]:.2f} 秒；
+候选 {summary["total_events"]} 个，窗口共 {summary["total_alarm_s"]:.2f} 秒。</p>
+<p class="note">{html.escape(summary["note"])} 文件夹名“异常”不是逐段真值。
+微弱候选已过滤，但过滤结果不代表确定是噪声；仍可能漏掉弱异常。
+点击录音名称可查看频谱窗口、播放音频并审核。</p>
+<table><thead><tr><th>录音 / 详细报告</th><th>时长 s</th><th>窗口数</th>
+<th>窗口时长 s</th><th>过滤候选数</th><th>窗口范围 s</th></tr></thead><tbody>{"".join(rows)}</tbody></table>
+{"<h2>未成功处理</h2><ul>"+failures+"</ul>" if failures else ""}
+<p><a href="summary.json">完整汇总 JSON</a> · 各录音子目录含 events.csv、windows/、review.csv。</p>
+<details><summary>本批统一配置</summary><pre>{cfg}</pre></details></html>"""
+    target = out / "index.html"
+    target.write_text(body, encoding="utf-8")
+    return target

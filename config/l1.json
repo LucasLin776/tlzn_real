@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "detector": "spectral_change",
+  "version": "spectral_event_v2",
+  "threshold": 6,
+  "feature_config": {
+    "sr": 44100,
+    "n_fft": 2048,
+    "hop": 441,
+    "n_mels": 64,
+    "fmin": 20,
+    "fmax": 16000,
+    "target_step": 0.02,
+    "compare_s": 0.1,
+    "smooth_s": 0.06,
+    "dynamic_range_db": 40
+  },
+  "postprocess": {
+    "min_duration": 0.06,
+    "merge_gap": 0.35,
+    "low_ratio": 0.6,
+    "padding": 0.05,
+    "reference_s": 0.6,
+    "release_db": 3.0,
+    "quiet_s": 0.25,
+    "settle_s": 0.6,
+    "stability_db": 1.5,
+    "min_prominence": 0.3,
+    "relative_floor_db": 15.0
+  }
+}

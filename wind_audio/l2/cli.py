@@ -92,7 +92,12 @@ def cmd_pipeline(a):
     if not source.is_file():
         raise ValueError("pipeline 接受单个 WAV；批量先使用 run，再逐份 l2-run")
     out = Path(a.out)
-    result = main(["run", "--input", str(source), "--model", a.l1_model, "--out", str(out / "l1")])
+    argv = ["run", "--input", str(source), "--out", str(out / "l1")]
+    if a.l1_config:
+        argv += ["--config", a.l1_config]
+    if a.l1_threshold is not None:
+        argv += ["--threshold", str(a.l1_threshold)]
+    result = main(argv)
     if result:
         return result
     run_events(out / "l1/events.json", a.l2_model, a.checkpoint, out / "events.json", a.device)
@@ -144,7 +149,9 @@ def register(sub):
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("pipeline", help="单 WAV 完整两级推理")
-    for key in ("input", "l1-model", "l2-model", "checkpoint", "out"):
+    for key in ("input", "l2-model", "checkpoint", "out"):
         p.add_argument("--" + key, required=True)
     p.add_argument("--device", default="cpu")
+    p.add_argument("--l1-config", help="可选 L1 检测配置，无需模型权重")
+    p.add_argument("--l1-threshold", type=float)
     p.set_defaults(func=cmd_pipeline)

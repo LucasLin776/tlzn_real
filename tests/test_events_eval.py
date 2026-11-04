@@ -60,6 +60,29 @@ class EventExtractionTests(unittest.TestCase):
 
 
 class FileEvaluationTests(unittest.TestCase):
+    def test_short_ground_truth_uses_continuous_boundaries(self):
+        rec = record("a", "a.wav", 1, fully_reviewed=False)
+        anns = [ann("x", "a", 0.011, 0.029, "anomaly")]
+        pred = [{"start_s": 0.01, "end_s": 0.03}]
+        result = evaluate_file_events(rec, anns, pred)
+        self.assertEqual(result["n_matched"], 1)
+        self.assertAlmostEqual(result["anomaly_s"], .018)
+        self.assertAlmostEqual(result["alarm_s"], .018)
+
+    def test_matched_windows_still_count_normal_overlap(self):
+        rec = record("a", "a.wav", 10, fully_reviewed=True)
+        anns = [ann("x", "a", 2, 3, "anomaly")]
+        result = evaluate_file_events(rec, anns, [{"start_s": 1, "end_s": 4}])
+        self.assertEqual(result["n_matched"], 1)
+        self.assertAlmostEqual(result["fp_normal_s"], 2)
+
+    def test_unknown_time_is_not_alarm_time(self):
+        rec = record("a", "a.wav", 10, fully_reviewed=False)
+        anns = [ann("x", "a", 2, 3, "anomaly")]
+        result = evaluate_file_events(rec, anns, [{"start_s": 0, "end_s": 10}])
+        self.assertAlmostEqual(result["alarm_s"], 1)
+        self.assertEqual(result["n_matched"], 1)
+
     def test_unknown_is_excluded_and_normal_hours_are_denominator(self):
         rec = record("a", "a.wav", 10.0, fully_reviewed=False)
         anns = [ann("x", "a", 2.0, 3.0, "anomaly"), ann("n", "a", 4.0, 9.0, "normal")]

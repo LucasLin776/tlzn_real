@@ -4,7 +4,7 @@ Thresholding is hysteresis: enter above ``threshold``, leave below
 ``threshold * low_ratio``.  Intervals separated by <= ``merge_gap`` seconds are
 merged; events shorter than ``min_duration`` are dropped.  A short event can
 therefore be lost by design -- the settings are recorded in the model metadata
-and must be calibrated, not assumed.
+and should be checked against annotated validation recordings.
 """
 from __future__ import annotations
 

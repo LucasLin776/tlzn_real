@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wind-audio"
-version = "0.3.0"
-description = "Two-stage wind-turbine audio detection with reviewed continual learning"
+version = "0.5.0"
+description = "Training-free spectral windows and reviewed PANNs continual learning"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["numpy>=1.24,<3", "torch>=2.6,<3"]

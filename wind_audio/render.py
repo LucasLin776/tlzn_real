@@ -98,6 +98,7 @@ def _event_boxes(img: np.ndarray, events: list[dict], duration: float) -> None:
         _vline(img, x0, EVENT_COLOR, 2)
         _vline(img, x1, EVENT_COLOR, 2)
         img[0:4, max(0, x0) : min(w, x1 + 1)] = EVENT_COLOR
+        img[-4:, max(0, x0) : min(w, x1 + 1)] = EVENT_COLOR
 
 
 def waveform_png(
