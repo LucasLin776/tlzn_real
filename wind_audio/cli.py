@@ -27,6 +27,7 @@ from .data import (
     write_annotations,
 )
 from .detectors import SpectralChangeDetector, StabilityDetector, load_detector
+from .labeling import collapse_anomalies, label_text
 from .normal import NormalConfig, NormalModelDetector
 from .stability import StabilityConfig
 from .state import EventConfig
@@ -69,6 +70,10 @@ def _write_json(path: str | Path, payload: dict) -> Path:
 
 def _safe_name(name: str) -> str:
     return re.sub(r"[^0-9A-Za-z_\-\u4e00-\u9fff]+", "_", name)[:80] or "audio"
+
+
+def _rate(value) -> str:
+    return "n/a" if value is None else f"{value:.4f}"
 
 
 # Command-line flags that only make sense for one detector generation.
@@ -248,11 +253,43 @@ def cmd_split(args) -> int:
 
 # ---------------------------------------------------------------- evaluate
 def cmd_evaluate(args) -> int:
+    normal_command = args.cmd == "l1-test-normal"
+    if normal_command:
+        if not args.config:
+            raise ValueError("l1-test-normal 必须通过 --config 指定训练得到的正常样本 model.json")
+        if args.target == "anomaly":
+            raise ValueError("l1-test-normal 只对比正常区域，不能设置 --target anomaly")
+        if (args.audio_dir and args.labels and Path(args.labels).is_dir()) or args.dataset_dir:
+            args.labels_are_stable = True
     detector = _detector_from_args(args)
+    target = args.target or ("normal" if normal_command or isinstance(detector, NormalModelDetector) else "anomaly")
+    if target == "normal" and not isinstance(detector, NormalModelDetector):
+        raise ValueError("正常区域测试需要训练后的正常模型 model.json；当前加载的是旧异常检测配置")
+    print(f"测试模型：{detector.version}；对比目标：{'正常区域' if target == 'normal' else '异常窗口'}")
     out = Path(args.out)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise ValueError("评估输出目录非空，请使用新目录，避免覆盖结果或标注")
-    if args.audio_dir:
+    if not (args.manifest or args.audio_dir or args.dataset_dir):
+        raise ValueError("l1-test 需要 --manifest（+--annotations）、--audio-dir（+--labels）或 --dataset-dir 之一")
+    if args.dataset_dir:
+        if args.labels or args.annotations:
+            raise ValueError("--dataset-dir 自带各批次的 音频/ 与 标注/，不能再传 --labels/--annotations")
+        if args.assume_unlabeled_normal:
+            raise ValueError("--dataset-dir 按批次目录的正常/平稳标注导入，不能再加 --assume-unlabeled-normal")
+        if args.pairing != "stem":
+            raise ValueError("--pairing 仅用于 --audio-dir 标注目录；批次目录固定 sorted 配对")
+        args.labels_are_stable = True
+        manifest = out / "manifest.csv"
+        from .markers import import_batches
+        records, anns, warnings, batch_of = import_batches(
+            args.dataset_dir, manifest, out / "annotations.csv", pairing="sorted",
+            stable_markers=True, min_gap_s=0.0 if target == "normal" else 0.1)
+        counts = {}
+        for name in batch_of.values():
+            counts[name] = counts.get(name, 0) + 1
+        warnings.append(f"合并 {len(counts)} 个批次: "
+                        + "，".join(f"{k} {v} 条" for k, v in sorted(counts.items())))
+    elif args.audio_dir:
         if not args.labels or args.annotations:
             raise ValueError("--audio-dir 必须搭配 --labels，不能同时传 --annotations")
         audio_dir, labels_path = Path(args.audio_dir), Path(args.labels)
@@ -272,14 +309,15 @@ def cmd_evaluate(args) -> int:
             records, anns, warnings = import_markers(
                 args.audio_dir, args.labels, manifest, out / "annotations.csv",
                 pairing=args.pairing, assume_unlabeled_normal=args.assume_unlabeled_normal,
-                stable_markers=args.labels_are_stable)
+                stable_markers=args.labels_are_stable, min_gap_s=0.0 if target == "normal" else 0.1)
             if not args.labels_are_stable:
                 names = [a.fault_type for a in anns if a.fault_type]
                 calm = sum(1 for n in names if "正常" in n or "normal" in n.lower())
                 if names and calm * 2 >= len(names):
                     warnings.append(
-                        f"标注中有 {calm}/{len(names)} 个名称含「正常」——若这批标的是平稳区间，"
-                        "请加 --labels-are-stable，否则平稳段会被当成异常，指标会整体反过来")
+                        f"标注中有 {calm}/{len(names)} 个名称含「正常」：这批标的是正常/平稳区域，"
+                        "应改用 l1-train-normal 训练 + l1-test-normal 测试（模型输出正常区域）；"
+                        "若仍走异常通路，请加 --labels-are-stable 只修正评估口径")
         else:
             if args.pairing != "stem":
                 raise ValueError("--pairing 仅用于标注目录")
@@ -288,7 +326,7 @@ def cmd_evaluate(args) -> int:
                 assume_unlabeled_normal=args.assume_unlabeled_normal)
     else:
         if not args.annotations or args.labels or args.assume_unlabeled_normal or args.pairing != "stem":
-            raise ValueError("--manifest 必须搭配 --annotations；导入选项仅用于 --audio-dir")
+            raise ValueError("--manifest 必须搭配 --annotations；导入选项仅用于 --audio-dir / --dataset-dir")
         manifest = Path(args.manifest)
         records, anns, errors, warnings = _load_dataset(args)
         _require_clean(errors)
@@ -306,21 +344,42 @@ def cmd_evaluate(args) -> int:
         result = evaluate_detector(
             detector, records, anns, audio_ids, manifest, detector.feature_config,
             iou_threshold=args.match_iou, on_file=report.add if report else None,
+            target_label=target,
         )
-        if result["file_accuracy"] is None and result["time_accuracy"] is None:
+        if result.get("file_accuracy") is None and result["time_accuracy"] is None:
             raise ValueError("没有可评估标签；请提供文件标签、精确区间，或确认完整审核后设置 --assume-unlabeled-normal")
     if report is not None:
         result["visual_report"] = report.metadata()
     result["detector_config"] = detector.to_dict()
-    result["mode"] = "l1-test"
+    result["mode"] = "l1-test-normal" if target == "normal" else "l1-test"
     result["selection"] = args.split if args.splits else "all_manifest"
     result["input"] = {"manifest": str(manifest.resolve()), "labels": args.labels,
-                       "annotations": args.annotations, "pairing": args.pairing if args.audio_dir else None,
+                       "annotations": args.annotations,
+                       "dataset_dir": str(Path(args.dataset_dir).resolve()) if args.dataset_dir else None,
+                       "pairing": (args.pairing if args.audio_dir else
+                                   ("sorted" if args.dataset_dir else None)),
                        "assume_unlabeled_normal": args.assume_unlabeled_normal,
                        "labels_are_stable": bool(getattr(args, "labels_are_stable", False))}
+    result["input"]["annotation_gap_tolerance_s"] = 0.0 if target == "normal" else 0.1
+    if isinstance(detector, NormalModelDetector):
+        prior_ids = {aid for ids in detector.training.get("split_ids", {}).values() for aid in ids}
+        if prior_ids.intersection(audio_ids):
+            result["data_reuse_warning"] = "本次包含模型训练报告中已有的录音编号，是回放检查，不是新数据盲测。"
     result["warnings"] = warnings
     metrics, brief = write_eval_outputs(result, args.out)
     from .evaluate import _percent
+    if target == "normal":
+        tm, rm = result["time_metrics"], result["normal_region_metrics"]
+        print(f"正常区域对比：人工 {rm['n_gt']} 段，模型 {rm['n_pred']} 段")
+        print(f"正常时长精确率={_percent(tm['precision'])}；正常时长召回率={_percent(tm['recall'])}；"
+              f"时长准确率={_percent(tm['accuracy'])}")
+        print(f"异常错当正常={tm['fp']:.3f}s；正常被排除={tm['fn']:.3f}s")
+        print(f"输出: {metrics}, {brief}, {out / 'normal_regions.csv'}")
+        if report is not None:
+            print(f"正常区域对照 PDF: {out / 'comparison.pdf'}（{result['visual_report']['pages']} 页）")
+        if result.get("data_reuse_warning"):
+            print(result["data_reuse_warning"])
+        return 0
     print(f"文件准确率={_percent(result['file_accuracy'])}；时长准确率={_percent(result['time_accuracy'])}")
     print(f"L1 窗口评估：GT={result['n_gt_events']}，预测={result['n_pred_events']}")
     print(f"召回={result['event_recall']}；精确率={result['event_precision']}；"
@@ -439,6 +498,7 @@ def _run_one(
              cfg.to_dict(), threshold, postprocess])[:20]
     # Keep the existing report schema, but never load labels in detection mode.
     segments = traces.get("stable_segments") or []
+    label = collapse_anomalies([(e["start_s"], e["end_s"]) for e in events], duration)
     regions = [{"start_s": s["start_s"], "end_s": s["end_s"], "label": "normal"}
                for s in segments]
     gt = []
@@ -529,11 +589,13 @@ def _run_one(
                   "requires_training": bool(getattr(detector, "requires_training", False))},
         "events": events,
         "stable_segments": segments,
+        "label": label,
         "diagnostics": diagnostics,
         "annotations": {"regions": [], "gt_events": [], "source": None},
     }
     _write_json(out_dir / "events.json", payload)
     _events_csv(events, out_dir / "events.csv")
+    _write_json(out_dir / "label.json", {k: label[k] for k in ("intervals", "count", "rule", "max_intervals")})
     if segments:
         with (out_dir / "stable_segments.csv").open("w", encoding="utf-8-sig", newline="") as fh:
             writer = csv.DictWriter(fh, fieldnames=["index", "start_s", "end_s", "duration_s", "coverage"])
@@ -580,10 +642,14 @@ def _run_one(
             "clip_ratio": quality["clip_ratio"],
             "stable_segments": len(segments),
             "stable_s": round(sum(s["duration_s"] for s in segments), 2),
+            "label": label,
             "report": str(report), "out": str(out_dir)}
 
 
 def cmd_run(args) -> int:
+    from .l1_panns.cli import maybe_legacy_detect
+    if maybe_legacy_detect(args):
+        return 0
     input_path = Path(args.input)
     if input_path.is_dir():
         files = sorted(p for p in input_path.rglob("*") if p.is_file() and p.suffix.lower() == ".wav")
@@ -649,6 +715,15 @@ def cmd_run(args) -> int:
                    "note": "检测输出，不是准确率验证；无精确标注不能计算召回或误报率。"}
         _write_json(out_base / "summary.json", summary)
         print(f"批量总览: {write_batch_report(out_base, summary)}")
+    if results:
+        out_base.mkdir(parents=True, exist_ok=True)
+        with (out_base / "labels.csv").open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["audio_id", "file", "n_intervals", "rule", "intervals_s"])
+            for r in results:
+                label = r.get("label") or {"intervals": [], "count": 0, "rule": "unknown"}
+                writer.writerow([r.get("audio_id", ""), r.get("file", ""), label["count"],
+                                 label["rule"], label_text(label)])
     return 0 if len(results) == len(files) else 1
 
 
@@ -679,19 +754,27 @@ def cmd_train_normal(args) -> int:
     from .normal_fit import fit_normal
     cfg = NormalConfig(enter_s=args.enter_s, release_s=args.normal_release_s,
                        min_duration=args.min_dur, merge_gap=args.merge_gap)
+    # Batch folders are pooled, so the sensible defaults differ from the
+    # single-directory entry: shuffle instead of "the newest files are the test".
+    split_mode = args.split or ("shuffle" if args.dataset_dir else "temporal")
     detector, report = fit_normal(
-        args.audio_dir, args.labels, args.out, pairing=args.pairing,
+        args.audio_dir, args.labels, args.out, dataset_dir=args.dataset_dir, pairing=args.pairing,
         fully_reviewed=args.fully_reviewed_normal, normal=cfg, alpha=args.alpha,
-        calibration_fraction=args.calibration_fraction, test_fraction=args.test_fraction)
+        calibration_fraction=args.calibration_fraction, test_fraction=args.test_fraction,
+        split_mode=split_mode, seed=args.seed)
     out = Path(args.out)
     _write_json(out / "model.json", detector.to_dict())
     _write_json(out / "training_report.json", report)
     print(f"正常模型已保存 -> {out / 'model.json'}")
+    for warning in report["warnings"]:
+        print(f"  · {warning}")
+    print(f"划分: {report['split_policy']}")
     print("只使用训练/校准集的正常区间；留出检查未用于拟合或选择阈值。")
     for group, metrics in report["metrics"].items():
         tm = metrics["time_metrics"]
-        print(f"  {group}: 时长准确率={metrics['time_accuracy']} "
-              f"异常时长召回={tm['recall']} 精确率={tm['precision']}")
+        print(f"  {group}: {metrics['files']} 条，时长准确率={_rate(metrics['time_accuracy'])} "
+              f"异常时长召回={_rate(tm['recall'])} 精确率={_rate(tm['precision'])} "
+              f"事件召回={_rate(metrics['event_recall'])} 正常误报={tm['fp']:.2f}s")
     return 0
 
 
@@ -809,10 +892,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     normal = sub.add_parser("l1-train-normal", help="只从标注正常片段学习波动容差，输出可复用的正常模型")
-    normal.add_argument("--audio-dir", required=True)
-    normal.add_argument("--labels", required=True, help="正常区间标注目录，名称为 正常/normal（可带编号）")
+    normal.add_argument("--audio-dir", help="单批音频目录；与 --dataset-dir 二选一")
+    normal.add_argument("--labels", help="单批正常区间标注目录，名称为 正常/normal（可带编号）")
+    normal.add_argument("--dataset-dir",
+                        help="批次根目录：每个子目录含 音频/ 与 标注/（如 新一批/B05、B06），全部批次合并训练")
     normal.add_argument("--out", required=True, help="新的训练输出目录，保存模型/报告/配对表")
-    normal.add_argument("--pairing", choices=["stem", "sorted"], default="stem")
+    normal.add_argument("--pairing", choices=["stem", "sorted"],
+                        help="配对方式；单批默认 stem，批次目录默认 sorted（要求编号与音频时间顺序一致）")
+    normal.add_argument("--split", choices=["temporal", "shuffle"],
+                        help="数据划分：temporal 按时间顺序切（单批默认）；shuffle 全局混合打散（批次目录默认）")
+    normal.add_argument("--seed", type=int, default=0, help="shuffle 划分的随机种子，默认 0，可复现")
     normal.add_argument("--fully-reviewed-normal", action="store_true", help="确认所有正常区间均已标出，其余为异常")
     normal.add_argument("--alpha", type=float, default=0.01, help="正常校准帧的经验尾部比例，不是事件误报率保证")
     normal.add_argument("--calibration-fraction", type=float, default=0.2)
@@ -864,13 +953,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--seed", type=int, default=42)
     s.set_defaults(func=cmd_split)
 
-    ev = sub.add_parser("l1-test", aliases=["evaluate"],
+    ev = sub.add_parser("l1-test", aliases=["evaluate", "l1-test-normal"],
                         help="L1 测试版：音频 + 标签 → 检验器 → 准确率/召回率/逐条对比",
                         description="L1 测试版：必须提供音频和标签；标签仅用于检验，同检测版共用 L1 算法。")
-    source = ev.add_mutually_exclusive_group(required=True)
+    source = ev.add_mutually_exclusive_group()
     source.add_argument("--manifest", help="已有标准音频清单，搭配 --annotations")
-    source.add_argument("--audio-dir", help="WAV 目录，搭配 --labels")
-    truth = ev.add_mutually_exclusive_group(required=True)
+    source.add_argument("--audio-dir", help="单批 WAV 目录，搭配 --labels")
+    source.add_argument("--dataset-dir",
+                        help="批次根目录：每个子目录含 音频/ 与 标注/，一次评估全部批次并输出对照图/PDF")
+    truth = ev.add_mutually_exclusive_group()
     truth.add_argument("--annotations", help="标准 annotations.csv，搭配 --manifest")
     truth.add_argument("--labels", help="简易 CSV/JSON 文件，或 Name/Start/Duration 标注目录，搭配 --audio-dir")
     ev.add_argument("--pairing", choices=["stem", "sorted"], default="stem",
@@ -879,6 +970,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="声明所有音频已完整审核，未标注部分及空标注均为正常")
     ev.add_argument("--labels-are-stable", action="store_true",
                     help="标注标的是平稳区间：区间内为正常，录音内其余时间按异常评估")
+    ev.add_argument("--target", choices=["normal", "anomaly"],
+                    help="对比目标；正常模型默认 normal，旧模型默认 anomaly；normal 图中上下均为正常区域")
     _add_detector_args(ev)
     ev.add_argument("--splits", help="可选固定划分；不传则评估整个清单")
     ev.add_argument("--split", choices=["val", "test"], default="test")
@@ -914,6 +1007,8 @@ def build_parser() -> argparse.ArgumentParser:
     rim.set_defaults(func=cmd_review_import)
     from .l2.cli import register
     register(sub)
+    from .l1_panns.cli import register as register_panns_l1
+    register_panns_l1(sub)
     return p
 
 

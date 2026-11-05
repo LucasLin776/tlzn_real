@@ -2,14 +2,19 @@
 
 ## 数据约定
 
-本次使用 B05：96 条约 30 秒音频、203 段正常标注。用户已确认所有正常区间均被标出，
-`B05-001` 等编号与音频文件名时间顺序对应。`B05-071` 空标注应整段计为异常。
-名称支持 `正常` / `normal` 开头（可带编号）；旧异常标注不能作为正常训练样本。
+本次使用「新一批」的 3 个批次：B05 96 条 + B06 50 条 + B07 50 条 = 196 条约 30 秒音频、
+713 段正常标注，来自 3 台设备（`.111` / `.107` / `.104`）。每批内部 `Bxx-001` 等编号
+与音频文件名时间顺序对应，因此批次目录默认 `--pairing sorted`；交叉批次用批次名区分编号。
+`B05-071` 空标注应整段计为异常。
+名称支持 `正常` / `normal` 开头（可带编号）；旧异常标注不能作为正常训练样本，
+导入时会直接报错，不会把"标异常"的批次混进来。
 少于 0.1 秒的标注缝隙沿用旧导入器的边界容差，不生成异常真值；这些未明确标注的帧也不参与学习。
 
-`--fully-reviewed-normal` 明确声明完整标注，`--pairing sorted` 明确声明顺序配对。
-默认同名配对，不因文件数相同擅自匹配。当前训练入口只支持上述完整正常标注；
-若未来仅挑部分正常样本，需要单独支持“未标注=未知”的导入/评估模式，不可直接复用完整标注开关。
+文件夹格式固定为「根目录/批次/音频」与「根目录/批次/标注」，以后的新数据照此放置即可，
+命令不用改。`--fully-reviewed-normal` 明确声明完整标注；`--pairing sorted` 明确声明顺序配对
+（批次模式默认，但仍是断言而不是自动推断）。默认同名配对，不因文件数相同擅自匹配。
+当前训练入口只支持上述完整正常标注；若未来仅挑部分正常样本，需要单独支持
+"未标注=未知"的导入/评估模式，不可直接复用完整标注开关。
 
 ## 学习和检测
 
@@ -34,60 +39,92 @@
 
 ## 使用
 
+数据按批次文件夹交付时，用 `--dataset-dir` 一次训练全部批次：根目录下每个子目录是一个批次，
+每批含 `音频/` 与 `标注/`。批次目录默认 `--pairing sorted`（编号顺序=音频时间顺序）、
+`--split shuffle`（全部录音跨批次打散后按 60/20/20 划分）。
+
 ```bash
 conda activate post_training
 cd /Users/shuoqinlin/Desktop/wind_audio
 python -m wind_audio l1-train-normal \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --labels /Users/shuoqinlin/Desktop/数据/B05/标注 \
-  --pairing sorted --fully-reviewed-normal \
-  --out runs/normal_b05_new
+  --dataset-dir /Users/shuoqinlin/Desktop/数据/新一批 \
+  --fully-reviewed-normal --split shuffle --seed 0 \
+  --out runs/normal_mixed_v1
 
 python -m wind_audio l1-detect \
-  --input /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --config runs/normal_b05_final/model.json \
-  --out runs/normal_b05_new_detection
+  --input /Users/shuoqinlin/Desktop/数据/新一批 \
+  --config runs/normal_mixed_v1/model.json \
+  --out runs/normal_mixed_v1_detection
 
+# 全量对照报告：196 张逐条图片 + 196 页 comparison.pdf + 全部 CSV/JSON/简报
 python -m wind_audio l1-test \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --labels /Users/shuoqinlin/Desktop/数据/B05/标注 \
+  --dataset-dir /Users/shuoqinlin/Desktop/数据/新一批 \
+  --config runs/normal_mixed_v1/model.json \
+  --out runs/normal_mixed_v1_report
+
+# 只评估单批（含图片可省略 --no-plots）
+python -m wind_audio l1-test \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/新一批/B05/音频 \
+  --labels /Users/shuoqinlin/Desktop/数据/新一批/B05/标注 \
   --pairing sorted --labels-are-stable \
-  --config runs/normal_b05_final/model.json \
-  --no-plots --out runs/normal_b05_new_check
+  --config runs/normal_mixed_v1/model.json \
+  --no-plots --out runs/normal_mixed_check_B05
 ```
 
-第三条命令是全量回放检查，含训练数据，不是独立测试；正式阅读留出表现请看训练报告的 `metrics.test`。
-修改阈值或过滤参数之后须使用新输出目录，且应在开发/校准数据上决策，再用新会话评估。
-`--threshold` 对此模型表示正常偏离倍数，不是旧规则的 dB；特征配置禁止直接覆盖，需重训。
-不传 `--config` 不会自动使用最近模型，仍运行旧 v3 规则。
+- `--split temporal` 是旧的时间顺序切分；单批 `--audio-dir/--labels` 仍默认 `stem` + `temporal`。
+- `--seed` 固定打散结果，同一种子可复现同一划分；改比例用 `--calibration-fraction` / `--test-fraction`。
+- `l1-test --dataset-dir` 输出与单批口径一致：`comparison.pdf`（一条一页，上行为人工正常、
+  下行为模型正常）、`plots/NNNN_<id>.png` 四联图、`plots/index.csv`、`metrics.json`、
+  `per_file.csv`、`normal_regions.csv`、`labels.csv`、`brief.md` 及合并后的三个输入快照。
+- 回放检查含训练数据，不是独立测试；正式留出表现看训练报告的 `metrics.test`。
+- 修改阈值或过滤参数之后须使用新输出目录，且应在开发/校准数据上决策，再用新会话评估。
+  `--threshold` 对此模型表示正常偏离倍数，不是旧规则的 dB；特征配置禁止直接覆盖，需重训。
+- 不传 `--config` 不会自动使用最近模型，仍运行旧 v3 规则。
 
 ## 本次实测
 
-模型：`runs/normal_b05_final/model.json`；报告：`training_report.json`；配对：`pairing.csv`。
-本次完整可试听结果：`runs/normal_b05_review/index.html`（96 条均成功，180 个候选窗口）；
-每条录音有波形、时频图、偏离曲线、原音频和异常片段。全部文件的实际检测窗口与训练报告评估
-窗口一致，图像和音频资源引用均已校验。回归测试共 116 项，115 通过、1 项原有可选测试跳过。
+模型：`runs/normal_mixed_v1/model.json`；报告：`training_report.json`；配对/清单：`pairing.csv`、`manifest.csv`。
+数据：B05 96 条 + B06 50 条 + B07 50 条 = **196 条 / 3 台设备**（`.111` / `.107` / `.104`），
+总时长 5,880.5 s（标注正常 4,526.7 s、异常 1,352.0 s）。
+`seed=0` 打散后 **118 训练 / 39 校准 / 39 留出检查**，每组的批次构成都混合了 B05/B06/B07：
 
-| 集合 | 文件 | 用途 |
-|---|---|---|
-| B05-001–058 | 58 | 70,253 个正常内部帧学习尺度 |
-| B05-059–077 | 19 | 11,990 个正常内部帧校准阈值 |
-| B05-078–096 | 19 | 不参与当前模型拟合/校准/参数选择的留出检查 |
+| 集合 | 条数（B05/B06/B07） | 正常内部帧 | 用途 |
+|---|---|---:|---|
+| 训练 | 118（56/29/33） | 104,744 | 学习四个波动尺度的 99% 分位 |
+| 校准 | 39（23/7/9） | 41,081 | 在正常帧上定 `1-alpha` 分位阈值 |
+| 留出检查 | 39（17/14/8） | — | 不参与拟合/校准/参数选择 |
 
-留出总时长 570.05 秒，标注异常 245.23 秒：
+留出集：正常 867.7 s、异常 302.4 s。
+全量回放报告：`runs/normal_mixed_v1_report/`（196 张图 + 196 页 `comparison.pdf`）。
 
-| 按时长计算 | 结果 |
+| 全量回放（196 条，含训练数据） | 结果 |
 |---|---:|
-| 异常精确率 | 90.73% |
-| 异常召回率 | 44.26% |
-| 时长准确率 | 74.07% |
-| 异常时长 F1 | 59.49% |
-| 正常时长被误报比例 | 3.41% |
-| 正常时长误报 / 异常时长漏检 | 11.09 s / 136.70 s |
+| 时长准确率 | 84.07% |
+| 正常时长精确率 / 召回率 | 85.84% / 94.97% |
+| 正常区域 人工/模型/匹配 | 713 / 734 / 565 段 |
+| 正常区域精确率 / 召回率 | 76.98% / 79.24% |
+| 异常错当正常（漏检） | 709.30 s |
+| 正常被排除（误报） | 227.75 s |
 
-这版优先抑制误报，**漏检仍明显**。一段异常可能仅部分被覆盖，因此精确率高不表示异常抓全。
-当前四个统计特征及其阈值未证明最优，不能把漏检直接断言为特征表达能力上限。
 
-上述数据来自同一会话；没有跨设备/季节保证。B04 的 95 条音频与 B05 文件哈希完全重合，
-不能用 B04 作独立测试。历史 v3 开发也用过 B05，本次集合仅是当前拟合流程的留出检查，
-不是全项目盲测。下一步应补一批未参与历史开发的录音，重点复核漏检区间和轻噪音误报。
+| 按时长计算 | 训练 | 校准 | 留出检查 |
+|---|---:|---:|---:|
+| 时长准确率 | 0.837 | 0.879 | **0.817** |
+| 异常召回率 | 0.481 | 0.453 | **0.480** |
+| 异常时长精确率 | 0.751 | 0.724 | **0.717** |
+| 事件召回率 | 0.717 | 0.684 | **0.681** |
+| 事件精确率 | 0.801 | 0.770 | **0.698** |
+| 正常时长被误报 | 5.07% | 3.50% | **6.61%（57.4 s）** |
+
+留出集按批次差别很大，说明"混合打散"并没有把设备差异抹平：
+
+| 批次 | 条数 | 正常误报 | 异常覆盖 |
+|---|---:|---:|---:|
+| B05（.111） | 17 | 1.42% | 21.9% |
+| B06（.107） | 14 | 8.28% | 72.2% |
+| B07（.104） | 8 | 14.11% | 68.1% |
+
+漏检仍明显；同一段异常常只被部分覆盖，异常时长召回约 0.48。
+打散让同一设备的录音同时进入训练与留出检查，**留出指标是内插估计，不是独立设备测试**；
+要给出跨设备结论，必须留出一整台设备的全部录音。
+`alpha=0.01` 只是正常校准帧的经验尾部比例，不是事件误报率保证。

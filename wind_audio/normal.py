@@ -179,7 +179,12 @@ class NormalModelDetector:
         return (normal_features(bundle, self.normal) / self.scales).max(axis=1)
 
     def predict_events(self, bundle, threshold=None, postprocess=None):
+        """Compatibility API for anomaly consumers (including L2)."""
         return self.analyze(bundle, threshold, postprocess)[0]
+
+    def predict_normal_regions(self, bundle, threshold=None, postprocess=None):
+        """Primary normal-region output, without any labels as input."""
+        return self.analyze(bundle, threshold, postprocess)[1]["normal_regions"]
 
     def analyze(self, bundle, threshold=None, postprocess=None):
         self.feature_config.assert_compatible(bundle.config)
@@ -205,11 +210,13 @@ class NormalModelDetector:
         active = np.zeros(len(score), bool)
         for event in output:
             active |= (bundle.times >= event["start_s"]) & (bundle.times < event["end_s"])
+        normal_regions = normal_complement(output, bundle.duration_s)
         traces.update(active=active, stable=~active, normal_score=score, components=components,
-                      stable_segments=normal_complement(output, bundle.duration_s),
+                      stable_segments=normal_regions, normal_regions=normal_regions,
+                      primary_output="normal_regions",
                       output_mode="normal_model", anomaly_source="learned_normal_deviation",
                       curves=[{"key": "normal_deviation", "values": score, "threshold": threshold,
-                               "label": "偏离正常的程度", "unit": "ratio",
+                               "label": "偏离正常的程度", "unit": "deviation_ratio",
                                "title": "相对正常样本的偏离（不是概率）",
                                "note": "超过虚线后还需通过持续时间/强度过滤；阈值只来自正常样本。"}])
         return output, traces

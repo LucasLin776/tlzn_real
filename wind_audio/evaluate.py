@@ -355,7 +355,12 @@ def evaluate_detector(
     postprocess: dict | None = None,
     iou_threshold: float = 0.1,
     on_file=None,
+    target_label="anomaly",
 ) -> dict:
+    if target_label not in {"normal", "anomaly"}:
+        raise ValueError("测试目标必须为 normal / anomaly")
+    if target_label == "normal" and not hasattr(detector, "predict_normal_regions"):
+        raise ValueError("正常区域测试必须加载训练得到的正常样本 model.json，不接受旧异常检测配置")
     by_id = {r.audio_id: r for r in records}
     if not audio_ids:
         raise ValueError("评估集合为空")
@@ -364,16 +369,21 @@ def evaluate_detector(
     missing = set(audio_ids) - set(by_id)
     if missing:
         raise ValueError(f"评估集合引用不存在的 audio_id: {sorted(missing)}")
-    rows = []
+    rows, anomaly_rows = [], []
     for index, audio_id in enumerate(audio_ids, 1):
         rec = by_id[audio_id]
         x, sr = load_wav(resolve_audio_path(rec, manifest_path), target_sr=cfg.sr)
         bundle = extract_features(x, sr, cfg, audio_id)
-        if on_file is None:
+        if on_file is None and target_label == "anomaly":
             pred = detector.predict_events(bundle, threshold=threshold, postprocess=postprocess)
         else:
             pred, traces = detector.analyze(bundle, threshold=threshold, postprocess=postprocess)
-        row = evaluate_file_events(rec, anns, pred, iou_threshold)
+        if target_label == "normal":
+            from .normal_eval import evaluate_normal_regions
+            row = evaluate_normal_regions(rec, anns, traces["normal_regions"], iou_threshold)
+            anomaly_rows.append(evaluate_file_events(rec, anns, pred, iou_threshold))
+        else:
+            row = evaluate_file_events(rec, anns, pred, iou_threshold)
         row["audio_path"] = str(resolve_audio_path(rec, manifest_path))
         if on_file is not None:
             on_file(rec, anns, x, sr, bundle, traces, row, detector, index, len(audio_ids))
@@ -382,7 +392,12 @@ def evaluate_detector(
         row["crest_db"] = quality["crest_db"]
         row["rms_dbfs"] = quality["rms_dbfs"]
         rows.append(row)
-    overall = aggregate_file_metrics(rows)
+    if target_label == "normal":
+        from .normal_eval import aggregate_normal_metrics
+        overall = aggregate_normal_metrics(rows)
+        overall["anomaly_diagnostics"] = aggregate_file_metrics(anomaly_rows)
+    else:
+        overall = aggregate_file_metrics(rows)
     if detector.detector_type == "normal_envelope":
         overall["threshold"] = float(detector.threshold if threshold is None else threshold)
         overall["normal_config"] = detector.normal.to_dict()
@@ -415,6 +430,9 @@ def _null_safe(obj):
 
 
 def write_eval_outputs(result: dict, out_dir: str | Path) -> tuple[Path, Path]:
+    if result.get("target_label") == "normal":
+        from .normal_eval import write_normal_outputs
+        return write_normal_outputs(_null_safe(result), out_dir)
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     result = _null_safe(result)

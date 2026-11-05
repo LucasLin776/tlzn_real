@@ -233,6 +233,9 @@ def load_detector(config_path=None):
         raise ValueError("请传入 L1 JSON 配置文件，不再加载旧训练模型目录")
     obj = json.loads(path.read_text(encoding="utf-8"))
     schema = obj.get("schema_version")
+    if schema == 4 or obj.get("model_type") == "panns_temporal_dae_v1":
+        raise ValueError("PANNs 时序模型直接读取完整音频：检测用 l1-panns-detect 或 l1-detect；"
+                         "评估用 l1-panns-evaluate，不接受旧 L1 特征/规则")
     if schema == 3:
         from .normal import NormalModelDetector
         return NormalModelDetector.from_dict(obj)

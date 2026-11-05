@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .evaluate import _reviewed_regions, match_events
+from .evaluate import _percent, _reviewed_regions, match_events
 
 GREEN, RED, BLUE, ORANGE, GRAY = "#25805b", "#c53e4e", "#347eb8", "#ec8c20", "#dfe3e8"
 
@@ -58,7 +58,7 @@ def _envelope(waveform, sr, width=2400):
     return times, np.minimum.reduceat(waveform, edges[:-1]), np.maximum.reduceat(waveform, edges[:-1])
 
 
-def _timeline(ax, gt, pred, matches, regions, duration, font, *, no_truth):
+def _timeline(ax, gt, pred, matches, regions, duration, font, *, no_truth, normal=False):
     from matplotlib.font_manager import FontProperties
     text_font = FontProperties(size=7)
     renderer = ax.figure.canvas.get_renderer()
@@ -71,7 +71,7 @@ def _timeline(ax, gt, pred, matches, regions, duration, font, *, no_truth):
         # Place short-window labels on alternating levels to avoid collisions.
         text_ends = [-float("inf")] * 3
         if not events:
-            ax.text(.012, y, no_truth if truth else "无预测事件", transform=ax.get_yaxis_transform(),
+            ax.text(.012, y, no_truth if truth else ("无预测正常区域" if normal else "无预测事件"), transform=ax.get_yaxis_transform(),
                     fontproperties=font, fontsize=9, va="center", color="#7b8491")
         for index, event in enumerate(events):
             a, b = event["start_s"], event["end_s"]
@@ -92,7 +92,8 @@ def _timeline(ax, gt, pred, matches, regions, duration, font, *, no_truth):
             ax.text(middle, y + .18 + lane * .14, text, fontproperties=text_font,
                     ha="center", va="bottom", color="#344052")
     ax.set_ylim(-.35, 1.72)
-    ax.set_yticks([1, 0], ["标签时间段", "预测时间段"], fontproperties=font, fontsize=9)
+    ax.set_yticks([1, 0], ["人工正常区域", "模型正常区域"] if normal else ["标签时间段", "预测时间段"],
+                  fontproperties=font, fontsize=9)
     ax.tick_params(axis="y", length=0, pad=10)
     ax.grid(axis="x", color="#e0e5eb", linewidth=.6, zorder=0)
 
@@ -145,7 +146,9 @@ class ComparisonReport:
             self.canvas = self.Canvas(str(self.partial_pdf), pagesize=self.page_size, pageCompression=1)
             self.canvas.setTitle("L1 test: labels and predictions")
         duration = record.duration_s
-        gt, pred = row["ground_truth_events"], row["predicted_events"]
+        normal = row.get("target_label") == "normal"
+        gt, pred = ((row["ground_truth_normal_regions"], row["predicted_normal_regions"]) if normal else
+                    (row["ground_truth_events"], row["predicted_events"]))
         regions = _reviewed_regions(record, anns)
         clustered_gt, clustered_pred = merge_intervals(gt, self.gap), merge_intervals(pred, self.gap)
         cluster_matches = (match_events(clustered_pred, clustered_gt, row["iou_threshold"])["matches"]
@@ -155,13 +158,16 @@ class ComparisonReport:
         axes = fig.subplots(4, 1, sharex=True, gridspec_kw={"height_ratios": [1, 1, 1.4, 1.4]})
         fig.subplots_adjust(left=.095, right=.975, top=.835, bottom=.075, hspace=.48)
         fp = self.font
-        fig.text(.035, .965, f"L1 测试 | {record.audio_id}", fontproperties=fp, fontsize=16, weight="bold", color="#142b42")
+        title = "正常区域测试" if normal else "L1 测试"
+        fig.text(.035, .965, f"{title} | {record.audio_id}", fontproperties=fp, fontsize=16, weight="bold", color="#142b42")
         filename = Path(row["audio_path"]).name
         fig.text(.035, .939, filename, fontproperties=fp, fontsize=7.5, color="#667487")
         result_names = {"TP": "含事件 / 已报警", "TN": "正常 / 无报警", "FP": "正常 / 误报警", "FN": "含事件 / 未报警", "excluded": "文件标签未知"}
+        outcome = (f"正常精确率 {_percent(row['time_metrics']['precision'])} / 正常召回率 {_percent(row['time_metrics']['recall'])}"
+                   if normal else result_names[row['file_outcome']])
         fig.text(.035, .913,
-                 f"{duration:.2f} 秒  |  标签 {len(gt)} 个  |  预测 {len(pred)} 个  |  "
-                 f"匹配 {row['n_matched']}/{len(gt)}  |  {result_names[row['file_outcome']]}",
+                 f"{duration:.2f} 秒  |  标签 {len(gt)} 段  |  预测 {len(pred)} 段  |  "
+                 f"匹配 {row['n_matched']}/{len(gt)}  |  {outcome}",
                  fontproperties=fp, fontsize=10, color="#344052")
         legend = [Patch(facecolor=GREEN, label="匹配标签"), Patch(facecolor=RED, label="未匹配标签"),
                   Patch(facecolor=BLUE, label="模型预测"), Patch(facecolor=BLUE, edgecolor=ORANGE, linewidth=2, label="未匹配预测"),
@@ -190,7 +196,7 @@ class ComparisonReport:
                             label=f"{curve['label']}阈值 {curve['threshold']:g}")
         axes[1].set_title(primary["title"], loc="left", fontproperties=fp, fontsize=10)
         unit_label = {"dB": "分数 / dB", "noise": "变化 / 噪声σ", "ratio": "比例 (0–1)"}.get(
-            primary.get("unit"), primary.get("unit", ""))
+            primary.get("unit"), "正常偏离倍数" if primary.get("unit") == "deviation_ratio" else primary.get("unit", ""))
         axes[1].set_ylabel(unit_label, fontproperties=fp, fontsize=9)
         axes[1].set_ylim(bottom=0)
         small_font = fp.copy()
@@ -198,13 +204,16 @@ class ComparisonReport:
         axes[1].legend(loc="upper right", prop=small_font, framealpha=.9, ncol=4)
         axes[1].grid(color="#e0e5eb", lw=.6)
 
-        no_truth = "无异常区间标签（已审核正常）" if row["file_true_label"] == "normal" and row["unknown_s"] < 1e-8 else "无精确异常区间标签"
-        _timeline(axes[2], gt, pred, row["matches"], regions, duration, fp, no_truth=no_truth)
-        axes[2].set_title(f"原始事件对比 | 一对一匹配 IoU >= {row['iou_threshold']:g}",
+        no_truth = ("无人工正常区域" if normal else "无异常区间标签（已审核正常）"
+                    if row["file_true_label"] == "normal" and row["unknown_s"] < 1e-8 else "无精确异常区间标签")
+        _timeline(axes[2], gt, pred, row["matches"], regions, duration, fp, no_truth=no_truth, normal=normal)
+        region_name = "正常区域" if normal else "原始事件"
+        axes[2].set_title(f"{region_name}对比 | 一对一匹配 IoU >= {row['iou_threshold']:g}",
                           loc="left", fontproperties=fp, fontsize=10)
-        _timeline(axes[3], clustered_gt, clustered_pred, cluster_matches, regions, duration, fp, no_truth=no_truth)
+        _timeline(axes[3], clustered_gt, clustered_pred, cluster_matches, regions, duration, fp, no_truth=no_truth, normal=normal)
         suffix = f"匹配 {len(cluster_matches)}/{len(clustered_gt)}" if cluster_matches is not None else "未完整审核，仅显示范围"
-        axes[3].set_title(f"事件簇辅助对比 | 两侧间隔 <= {self.gap:g} 秒合并 | {suffix}",
+        cluster_title = "正常区域合并辅助对比" if normal else "事件簇辅助对比"
+        axes[3].set_title(f"{cluster_title} | 两侧间隔 <= {self.gap:g} 秒合并 | {suffix}",
                           loc="left", fontproperties=fp, fontsize=10)
         axes[3].set_xlabel("相对原始音频起点的时间（秒）", fontproperties=fp, fontsize=9)
         for ax in axes:
@@ -214,7 +223,9 @@ class ComparisonReport:
             for spine in ax.spines.values():
                 spine.set_color("#8c98a4")
                 spine.set_linewidth(.55)
-        fig.text(.035, .025, "上下两行使用同一时间轴。事件簇仅供观察，不修改标签、预测或正式指标。",
+        footer = ("上行：人工正常区域；下行：模型正常区域（非异常窗口）。辅助合并不修改正式指标。" if normal else
+                  "上下两行使用同一时间轴。事件簇仅供观察，不修改标签、预测或正式指标。")
+        fig.text(.035, .025, footer,
                  fontproperties=fp, fontsize=8, color="#667487")
         fig.text(.97, .025, f"{index} / {total}", ha="right", fontsize=8, color="#667487")
         name = re.sub(r"[^\w.-]+", "_", record.audio_id)[:80] or "audio"

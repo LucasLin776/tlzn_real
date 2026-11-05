@@ -1,8 +1,18 @@
 # Wind Audio：风机音频两级检测
 
-当前工程版本 **0.10.0**。新增 **normal_envelope_v1 正常样本学习模型**；原有
+新增独立 L1 模型类型 **`panns_temporal_dae_v1`**（仅完成代码，尚未训练/校准）：
+冻结 PANNs 中浅层时序特征 → 多尺度动态表示 → 小型时序去噪自编码器 → 网络残差事件。
+使用 `l1-panns-*` 命令，或在 `l1-detect --config` 中显式选择该模型；旧默认行为和 L2 不变。
+数据必须显式指定配对、标注语义及来源划分，unknown 不推导为正常。
+新训练入口支持 `--audio-dir`、`--labels` 和 `--check-only`；完整流程在正常训练、独立正常校准后，
+自动生成 `val/comparison.pdf`、`test/comparison.pdf` 及配套 CSV/JSON/简报（本次只实现代码，未运行训练）。
+详见 [L1 PANNs 结构、约束与占位路径命令](docs/L1_PANNS.md)。新 L1 需要已有 PyTorch 和本地 CNN14 权重，不自动安装或下载。
+
+当前工程版本 **0.11.0**。**normal_envelope_v1 正常样本学习模型**支持多批次目录一次训练
+（`--dataset-dir`）和跨批次混合打散划分（`--split shuffle`）；原有
 `spectral_stability_v3`、`spectral_event_v2` 配置保留，可复现历史结果。
 不传 `--config` 仍使用旧有 v3 默认规则；使用新路线必须传训练得到的 `model.json`。
+当前模型在 `runs/normal_mixed_v1/model.json`（B05+B06+B07 共 196 条）。
 
 | 层 | 输入与作用 | 输出 | 是否训练 |
 |---|---|---|---|
@@ -38,60 +48,113 @@ WAV 支持 8/16/32 位整数 PCM；24 位及浮点 WAV 需先转换。多声道�
 旧命令 `run`、`evaluate` 分别作为两者的别名保留；`run` 也不再接受标签输入。
 实际检测仍是离线 WAV 分析，不是实时流式服务。
 
-### 新路线：只学习正常片段（B05）
+### 多批次目录：一次训练全部批次（混合打散）
 
-用户已确认 B05 标注覆盖全部正常片段、编号与音频时间顺序对应；B02–B04 的旧异常标注不能混入。
+数据按「批次文件夹」交付：一个根目录下放多批，每批固定为 `音频/` + `标注/`。
+标注区间是**正常/平稳区间**，录音内其余时间按异常处理，编号顺序与音频时间顺序一致。
 
-```bash
-python -m wind_audio l1-train-normal \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --labels /Users/shuoqinlin/Desktop/数据/B05/标注 \
-  --pairing sorted --fully-reviewed-normal \
-  --out runs/normal_b05_new
-
-python -m wind_audio l1-detect \
-  --input /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --config runs/normal_b05_final/model.json \
-  --out runs/normal_b05_new_detection
+```text
+新一批/
+  B05/音频/*.wav   B05/标注/*.csv
+  B06/音频/*.wav   B06/标注/*.csv
+  B07/音频/*.wav   B07/标注/*.csv
 ```
 
-本次已训练的模型位于 `runs/normal_b05_final/model.json`，训练记录及留出检查指标位于同目录
-`training_report.json`。训练输出目录必须是新的；第一条命令会产生自己的 `model.json`。
+`--dataset-dir` 自动发现全部批次、合并成一次训练。批次目录默认
+`--pairing sorted`（编号顺序=音频时间顺序）与 `--split shuffle`（跨批次全局打散后再按
+60/20/20 划分）；单批 `--audio-dir/--labels` 保持旧行为（同名配对、按时间顺序切分）。
+
+```bash
+# 1) 训练
+python -m wind_audio l1-train-normal \
+  --dataset-dir /Users/shuoqinlin/Desktop/数据/新一批 \
+  --fully-reviewed-normal \
+  --out runs/normal_mixed_v1
+
+# 2) 全量对照报告：逐条图片 + comparison.pdf + 全部 CSV/JSON/简报
+python -m wind_audio l1-test \
+  --dataset-dir /Users/shuoqinlin/Desktop/数据/新一批 \
+  --config runs/normal_mixed_v1/model.json \
+  --out runs/normal_mixed_v1_report
+
+# 3) 实际检测（只要候选窗口和切片，不含人工对比）
+python -m wind_audio l1-detect \
+  --input /Users/shuoqinlin/Desktop/数据/新一批 \
+  --config runs/normal_mixed_v1/model.json \
+  --out runs/normal_mixed_v1_detection
+```
+
+第 2 条命令的输出与 `l1-test` 单批口径完全一致，共 9 个文件加 `plots/`：
+
+| 文件 | 内容 |
+|---|---|
+| `comparison.pdf` | 全部录音按 ID 自然顺序，一条一页（196 页），上行为人工正常区域、下行为模型正常区域 |
+| `plots/0001_B05-001.png` | 每条录音的四联图：波形、偏离曲线、原始区间对比、0.3 s 合并辅助对比 |
+| `plots/index.csv` | 页码 → audio_id → 原音频路径 → 图片，四列 |
+| `metrics.json` | 全部指标、逐文件明细、实际参数、IoU 匹配、PDF 元信息 |
+| `per_file.csv` | 每条录音的准确率/精确率/召回率与 TP/TN/FP/FN |
+| `normal_regions.csv` | 人工与模型正常区间逐段对照（含匹配序号与 IoU） |
+| `labels.csv` | 交付标签：每条录音一行，整段减正常段，>5 段则整段返回 |
+| `brief.md` | 中文摘要 |
+| `manifest.csv` / `annotations.csv` / `pairing.csv` | 合并后的输入快照（含批次归属） |
+
+图片和 PDF 默认开启；`--no-plots` 只出数值。合并评估目前只接受批次目录与正常/平稳口径，
+`--target anomaly` 仍走单批 `--audio-dir` 通路。
+
+本次已训练的模型为 `runs/normal_mixed_v1/model.json`，训练记录、逐文件批次归属和逐集合指标
+在同目录 `training_report.json`；`manifest.csv/annotations.csv/pairing.csv` 是合并后的输入快照。
+训练输出目录必须是新的；`--seed` 固定打散结果，可复现同一划分。
 正常模型学习的是**允许多大时间波动**，不是固定音色；轻微短偏离先过滤，强短事件仍保留，
 相邻异常可以合并，新工况稳定后结束报警。正常片段边界留出完整上下文，防止邻接异常污染训练。
 
-96 条文件按时间切为 **58 训练 / 19 校准 / 19 留出检查**，只有前两组的正常内部帧用于学习。
-本次留出检查：按时长计，精确率 **90.7%**、召回率 **44.3%**、准确率 **74.1%**，
-正常时长中 **3.4%** 被误报。当前是偏保守基线，仍有明显漏检，不能称为检测完备。
-本会话留出并非跨会话泛化证明，且 B05 曾被历史版本开发使用；不是全项目盲测。
+B05 96 条 + B06 50 条 + B07 50 条 = **196 条 / 3 台设备**，`seed=0` 打散为 **118 训练 / 39 校准 / 39 留出检查**，
+只有前两组的正常内部帧用于学习（104,744 / 41,081 帧）：
+
+| 集合 | 条数 | 时长准确率 | 异常时长召回 | 时长精确率 | 事件召回 | 正常误报时长 |
+|---|---:|---:|---:|---:|---:|---:|
+| 训练 | 118 | 0.837 | 0.481 | 0.751 | 0.717 | 136.3 s（正常时长的 5.07%） |
+| 校准 | 39 | 0.879 | 0.453 | 0.724 | 0.684 | 34.1 s（3.50%） |
+| **留出检查** | 39 | **0.817** | **0.480** | **0.717** | **0.681** | **57.4 s（6.61%）** |
+
+留出集按批次看差别很大：B05 误报 1.4%、异常覆盖 21.9%；B06 误报 8.3%、覆盖 72.2%；
+B07 误报 14.1%、覆盖 68.1%。打散让同一设备的录音同时进入训练与留出检查，
+**留出指标是内插估计，不是独立设备/跨会话测试**；要跨设备结论必须留出一整台设备。
+
+第 2 条命令的全量回放（196 条，含训练数据，不是盲测）：正常时长精确率 85.84%、
+召回率 94.97%、时长准确率 84.07%，人工正常 713 段 / 模型 734 段 / 匹配 565 段；
+异常错当正常 709.3 s、正常被排除 227.7 s。`brief.md` 与 `metrics.json` 里有完整口径，
+`comparison.pdf` 是 196 页逐条对照，用来人工复核漏检和误报的位置。
 详见 [正常样本学习说明](docs/NORMAL_MODEL.md)。
 
 ### 检测版：仅指定原始音频
 
 ```bash
 python -m wind_audio l1-detect \
-  --input /Users/shuoqinlin/Desktop/数据/B02/音频 \
-  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1_v3.json \
-  --out /Users/shuoqinlin/Desktop/wind_audio/runs/l1_detect_B02
+  --input /Users/shuoqinlin/Desktop/数据/新一批 \
+  --config runs/normal_mixed_v1/model.json \
+  --out runs/l1_detect_latest
 ```
 
 替换 `--input` 就能切换实际工作数据；也可以直接指定单条 `.wav` 的完整路径。
 目录输入生成 `index.html` 和逐文件报告；单文件输入直接生成 `report.html`。
+`--input` 递归扫描 WAV，因此直接传批次根目录会一次性处理全部批次。
 `review.csv` 是新生成的空审核模板，不是检测输入。
 
 ### 测试版：指定音频和标签
 
 ```bash
 python -m wind_audio l1-test \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B02/音频 \
-  --labels /Users/shuoqinlin/Desktop/数据/B02/标注 \
-  --pairing sorted --assume-unlabeled-normal \
-  --config /Users/shuoqinlin/Desktop/wind_audio/config/l1_v3.json \
-  --out /Users/shuoqinlin/Desktop/输出结果/B02_visual_v3
+  --audio-dir /Users/shuoqinlin/Desktop/数据/新一批/B05/音频 \
+  --labels /Users/shuoqinlin/Desktop/数据/新一批/B05/标注 \
+  --pairing sorted --labels-are-stable \
+  --config runs/normal_mixed_v1/model.json \
+  --no-plots --out runs/check_B05
 ```
 
-本数据集已确认：B02-001～100 对应音频按时间排序；所有音频完整审核；
-空标注和未标注部分为正常；全部标记均为 L1 目标事件，不区分名称。
+`l1-test` 仍按**单个批次**评估（多批次合并评估尚未提供，用 `training_report.json` 的
+`metrics.<集合>.per_file` 看合并后的逐文件结果）。
+本数据集已确认：B05-001～096 对应音频按时间排序；所有音频完整审核；
+标注区间是正常/平稳区间，其余时间为异常。
 `--pairing sorted` 仅用于已确认顺序对应的数据；默认按同名配对。
 输出目录必须为空或不存在，避免覆盖既有标注和评估结果。
 调整 `--threshold` 等参数或编辑配置后，用新的输出目录对比结果；测试命令不会自动训练 L1。
@@ -183,6 +246,23 @@ python -m wind_audio review-import \
 
 预测不能直接当人工真值；未审核部分不默认正常。还需抽查无告警录音以发现漏检。
 
+## 交付标签规则：每条录音一个标签
+
+检测与正常区域测试都会为每条录音产出一条交付标签（`labels.csv`）：
+
+- 标签内容 = 整条录音 **减去模型判定的正常段**，剩下的异常区间；
+- 若异常区间 **超过 5 段**，直接返回整条录音（0–时长）；
+- 0 段表示整条正常（`rule=none`），≤5 段按实际输出（`rule=as_detected`）。
+
+实现见 `wind_audio/labeling.py`，阈值 `MAX_INTERVALS = 5` 可改。输出位置：
+
+| 命令 | 文件 | 字段 |
+|---|---|---|
+| `l1-detect` | `<out>/labels.csv`、每条 `<out>/<文件>/label.json` | `audio_id, n_intervals, rule, intervals_s` |
+| `l1-test-normal` | `<out>/labels.csv` | 同上（模型侧标签，不影响指标） |
+
+B05 上 96 条的分布：36 条整条正常、51 条按实际段输出、9 条因超过 5 段整条返回。
+
 ## 平稳区域拟合（B05 口径）
 
 如果标注标的是**平稳区间**而不是异常事件，用 `--labels-are-stable` 评估，
@@ -190,15 +270,15 @@ python -m wind_audio review-import \
 
 ```bash
 python -m wind_audio l1-test \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --labels    /Users/shuoqinlin/Desktop/数据/B05/标注 \
+  --audio-dir /Users/shuoqinlin/Desktop/数据/新一批/B05/音频 \
+  --labels    /Users/shuoqinlin/Desktop/数据/新一批/B05/标注 \
   --pairing sorted --labels-are-stable \
-  --config config/l1_v3.json --no-plots --out runs/l1_v3/b05_base
+  --config config/l1_v3.json --no-plots --out runs/l1_v3_stable_base
 
 python -m wind_audio l1-fit \
-  --audio-dir /Users/shuoqinlin/Desktop/数据/B05/音频 \
-  --labels    /Users/shuoqinlin/Desktop/数据/B05/标注 \
-  --out config/l1_fit_b05.json --report runs/l1_v3/fit_b05/report.json
+  --audio-dir /Users/shuoqinlin/Desktop/数据/新一批/B05/音频 \
+  --labels    /Users/shuoqinlin/Desktop/数据/新一批/B05/标注 \
+  --out config/l1_fit_stable.json --report runs/l1_fit/report.json
 ```
 
 `l1-fit` 在平稳帧上估计每个判据的分布，把阈值放到其尾部（`--alpha`、`--alpha-stable` 控制目标误判率），
@@ -260,7 +340,7 @@ wind_audio/
 config/                       当前 L1 参数与 L2 类型表
 docs/                         标注规范、检验步骤、清理记录
 tests/                        自动化测试；数据在临时目录生成并自动清除
-reports/l1_B02/                本次最新 B02 结果，不复制原始音频
+runs/normal_mixed_v1/          当前正常模型（多批次合并 + 打散划分）
 ```
 
 旧版代码、演示模型、旧测试音频和结果已移除，清单及恢复位置见 [清理记录](docs/CLEANUP.md)。

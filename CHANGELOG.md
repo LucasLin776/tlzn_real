@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.0 — 2026-11-05
+
+- 新增多批次训练入口 `l1-train-normal --dataset-dir`：根目录下每个子目录是一批（`音频/` + `标注/`），
+  自动发现、合并成一份清单后一次训练；批次名写入 manifest 备注与训练报告，
+  跨批次 `audio_id` 重名直接报错，不会静默覆盖。
+- 新增 `--split shuffle`：全部录音跨批次全局打散后再按 60/20/20 划分，`--seed` 固定后可复现。
+  批次目录默认 shuffle，单批 `--audio-dir/--labels` 仍默认 temporal（时间顺序切分）。
+- 批次目录默认 `--pairing sorted`（编号顺序 = 音频时间顺序）；单批仍默认 `stem`。
+- 训练报告新增 `batch` / `split_mode` / `split_seed` / `batches` 字段，
+  `split_policy` 明确写出划分方式，并提示"同一设备跨训练与留出"的内插偏差。
+- 新增 `l1-test --dataset-dir`：一次评估全部批次，输出与单批口径一致——`comparison.pdf`
+  （一条一页，含书签与页码）、`plots/NNNN_<id>.png` 四联图、`plots/index.csv`、
+  `metrics.json`、`per_file.csv`、`normal_regions.csv`、`labels.csv`、`brief.md` 与输入快照。
+- `l1-test` 的参数组改为运行期校验（此前由 argparse 强制），错误信息与退出码 2 不变；
+  批次目录里混入的报告/模型目录会被跳过，只有「有音频没标注」的残缺批次才报错。
+- 清理：删除 B02–B04 旧数据与旧 `runs/`、`reports/` 结果，README 与文档改为批次目录口径。
+- 新增 9 项多批次导入、打散划分与端到端训练测试（合计 168 项，1 项可选跳过）。
+
 ## 0.10.0 — 2026-11-04
 
 - 新增 `l1-train-normal` 与 `normal_envelope_v1`：只学习明确正常区间的时间波动尺度，
@@ -11,6 +29,14 @@
 - 接入原有检测、评估、切片和 HTML 报告；明确模型预测正常不是人工标注。
 - B05 58/19/19 留出检查：时长 P=90.7%、R=44.3%、准确率=74.1%，正常时长误报=3.4%。
   保守基线有明显漏检；同会话且历史开发使用过 B05，不宣称盲测或跨设备泛化。
+
+## 0.9.1 — 2026-11-05
+
+- 新增交付标签规则 `wind_audio/labeling.py`：每条录音一条标签，
+  内容为整段减去正常段；异常区间超过 5 段时整条返回。
+  `l1-detect` 输出 `labels.csv` 与逐条 `label.json`，`l1-test-normal` 输出 `labels.csv`。
+- 修正 `collapse_anomalies` 只接受元组、收到字典时静默返回空标签的问题。
+- 新增 7 项标签规则测试。
 
 ## 0.9.0 — 2026-11-04
 

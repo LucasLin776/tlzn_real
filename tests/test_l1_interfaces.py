@@ -40,13 +40,23 @@ class L1InterfaceTests(unittest.TestCase):
                 self.assertEqual(error.exception.code, 2)
 
     def test_testing_requires_audio_and_labels_including_old_alias(self):
-        for command in ("l1-test", "evaluate"):
-            for supplied in (["--audio-dir", "audio"], ["--manifest", "manifest.csv"],
-                             ["--labels", "labels.csv"]):
-                with self.subTest(command=command, supplied=supplied), \
-                        contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
-                    cli.build_parser().parse_args([command, *supplied])
-                self.assertEqual(error.exception.code, 2)
+        """Either a source or its truth is missing: exit 2 before touching the disk."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+            for command in ("l1-test", "evaluate"):
+                for supplied, expected in (
+                        (["--audio-dir", "audio"], "必须搭配 --labels"),
+                        (["--manifest", "manifest.csv"], "必须搭配 --annotations"),
+                        (["--labels", "labels.csv"], "需要 --manifest"),
+                        (["--dataset-dir", "batches", "--labels", "labels.csv"], "不能再传"),
+                ):
+                    stderr = io.StringIO()
+                    with self.subTest(command=command, supplied=supplied), \
+                            contextlib.redirect_stderr(stderr):
+                        result = cli.main([command, *supplied, "--out", str(out)])
+                    self.assertEqual(result, 2)
+                    self.assertIn(expected, stderr.getvalue())
+                    self.assertFalse(out.exists())
 
     def test_actual_audio_has_same_windows_and_labels_cannot_change_prediction(self):
         with tempfile.TemporaryDirectory() as td, contextlib.redirect_stdout(io.StringIO()):
