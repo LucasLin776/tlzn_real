@@ -4,6 +4,24 @@ This is a fitted one-class statistical envelope, not a timbre classifier.
 Absolute pitch, spectrum and level are deliberately not model coordinates:
 a new steady operating state must become normal again. Parameters are frozen
 at inference, so persistent anomalies cannot enlarge their own noise tolerance.
+
+Scoring has two modes:
+
+* ``max``   -- the legacy ``max_j(values_j / scale_j)``: any single dimension
+  above its training tail fires.
+* ``joint`` -- one-sided whitened distance ``sqrt(u' R^-1 u)`` with
+  ``u = max(z - median, 0)``, rescaled so its training median matches the
+  legacy score.  It amplifies unusual *combinations* of the four features.
+  Measured caveat: a device that is uniformly more active, and a broadband
+  anomaly, both move along the dominant correlation axis, so whitening
+  discounts both; simulated cross-device false alarms improved only marginally
+  while broadband misses got worse.  It is therefore opt-in, not the default.
+
+Post-processing additionally enforces a minimum anomaly duration and a minimum
+normal gap (``min_anomaly_s`` / ``min_normal_s``) so that a few frames of
+boundary jitter cannot fragment the delivered regions.  A separate impulse
+channel reports short high-contrast peaks for manual review; it never changes
+``events``, the normal regions, or the duration metrics.
 """
 from __future__ import annotations
 
@@ -17,6 +35,8 @@ from .features import FeatureConfig
 FEATURE_NAMES = ("fast_change_db", "short_fluct_db", "drift_db", "long_fluct_db")
 # Physical lower bounds prevent almost-silent training from amplifying tiny noise.
 SCALE_FLOORS = np.array([0.75, 0.60, 0.75, 0.75])
+SCORE_MODES = ("joint", "max")
+CORRELATION_SHRINKAGE = 0.02
 
 
 @dataclass(frozen=True)
@@ -34,6 +54,14 @@ class NormalConfig:
     low_ratio: float = 0.80
     strong_ratio: float = 2.50
     padding: float = 0.05
+    # Segment-level constraints: a short fragment is a boundary artefact, not a
+    # second event, and a short normal island must not split one disturbance.
+    min_anomaly_s: float = 0.30
+    min_normal_s: float = 0.50
+    # Impulse channel: presence hints only, excluded from regions and metrics.
+    short_channel: bool = True
+    short_peak_ratio: float = 2.0
+    short_window_s: float = 0.10
 
     def __post_init__(self):
         if not all(np.isfinite(v) for v in asdict(self).values()):
@@ -46,6 +74,10 @@ class NormalConfig:
             raise ValueError("进入/退出/最短持续时间必须为正")
         if self.merge_gap < 0 or self.padding < 0 or not 0 < self.low_ratio < 1 or self.strong_ratio <= 1:
             raise ValueError("无效正常模型事件参数")
+        if self.min_anomaly_s < 0 or self.min_normal_s < 0 or self.short_window_s <= 0:
+            raise ValueError("最短异常段/最短正常间隙/短事件窗口不能为负")
+        if self.short_peak_ratio <= 1:
+            raise ValueError("短事件通道的峰值倍数必须大于 1")
 
     def to_dict(self):
         return asdict(self)
@@ -55,6 +87,84 @@ class NormalConfig:
         if set(data) - set(asdict(cls())):
             raise ValueError("正常模型包含未知参数")
         return cls(**data)
+
+
+@dataclass(frozen=True)
+class ScoreConfig:
+    """How per-frame feature values become one deviation score."""
+
+    mode: str = "max"
+    center: tuple = (0.0, 0.0, 0.0, 0.0)
+    precision: tuple = ()
+    normalizer: float = 1.0
+
+    def __post_init__(self):
+        if self.mode not in SCORE_MODES:
+            raise ValueError(f"打分方式只支持 {' / '.join(SCORE_MODES)}")
+        if self.mode == "joint":
+            if np.shape(self.precision) != (len(FEATURE_NAMES), len(FEATURE_NAMES)):
+                raise ValueError("联合打分需要 4x4 精度矩阵")
+            if not np.isfinite(np.asarray(self.precision)).all():
+                raise ValueError("精度矩阵必须为有限数值")
+            if not np.isfinite(self.normalizer) or self.normalizer <= 0:
+                raise ValueError("联合打分归一化系数必须为正")
+
+    def to_dict(self):
+        return {"mode": self.mode, "center": list(self.center),
+                "precision": [list(row) for row in self.precision],
+                "normalizer": float(self.normalizer)}
+
+    @classmethod
+    def from_dict(cls, data):
+        if not isinstance(data, dict):
+            raise ValueError("score 字段必须是对象")
+        allowed = {"mode", "center", "precision", "normalizer"}
+        if set(data) - allowed:
+            raise ValueError("score 字段包含未知键")
+        return cls(mode=data.get("mode", "max"),
+                   center=tuple(data.get("center", (0.0,) * len(FEATURE_NAMES))),
+                   precision=tuple(tuple(row) for row in data.get("precision", ())),
+                   normalizer=float(data.get("normalizer", 1.0)))
+
+
+def frame_score(values, scales, score: ScoreConfig):
+    """Turn raw dB features into the deviation score used by every threshold."""
+    z = np.asarray(values, dtype=np.float64) / np.asarray(scales, dtype=np.float64)
+    if score.mode == "max":
+        return z.max(axis=1)
+    center = np.asarray(score.center, dtype=np.float64)
+    precision = np.asarray(score.precision, dtype=np.float64)
+    u = np.maximum(z - center, 0.0)
+    quadratic = np.einsum("ij,ij->i", u @ precision, u)
+    return np.sqrt(np.maximum(quadratic, 0.0)) * score.normalizer
+
+
+def _fit_score(train, scales, mode):
+    """Fit the joint score on training frames (centres, correlation, rescale).
+
+    Degenerate training data (a dimension without any variation) carries no
+    correlation information, so the joint form falls back to ``max`` instead of
+    dividing by an almost zero median.
+    """
+    if mode == "max":
+        return ScoreConfig(mode="max")
+    z = np.asarray(train, dtype=np.float64) / np.asarray(scales, dtype=np.float64)
+    if np.any(np.std(z, axis=0) < 1e-9):
+        return ScoreConfig(mode="max")
+    center = np.median(z, axis=0)
+    correlation = np.corrcoef(z, rowvar=False)
+    correlation = np.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
+    n = len(FEATURE_NAMES)
+    correlation = (1 - CORRELATION_SHRINKAGE) * correlation + CORRELATION_SHRINKAGE * np.eye(n)
+    precision = np.linalg.pinv(correlation)
+    unit = ScoreConfig("joint", tuple(center), tuple(map(tuple, precision)), 1.0)
+    raw = frame_score(train, scales, unit)
+    legacy = z.max(axis=1)
+    median_raw = float(np.median(raw))
+    if not np.isfinite(median_raw) or median_raw < 1e-6:
+        return ScoreConfig(mode="max")
+    normalizer = float(np.clip(np.median(legacy) / median_raw, 1e-3, 1e3))
+    return ScoreConfig("joint", tuple(center), tuple(map(tuple, precision)), normalizer)
 
 
 def context_margin(feature_config, cfg):
@@ -131,52 +241,72 @@ class NormalModelDetector:
     version = "normal_envelope_v1"
     requires_training = True
 
-    def __init__(self, scales, threshold, feature_config=None, normal=None, training=None):
+    def __init__(self, scales, threshold, feature_config=None, normal=None, training=None,
+                 score=None):
         self.feature_config = feature_config or FeatureConfig()
         self.normal = normal or NormalConfig()
         self.scales = np.asarray(scales, dtype=np.float64).copy()
         self.threshold = float(threshold)
         self.training = dict(training or {})
+        self.score_config = score or ScoreConfig(mode="max")
         if self.scales.shape != (len(FEATURE_NAMES),) or not np.isfinite(self.scales).all() or (self.scales <= 0).any():
             raise ValueError("正常模型尺度必须是四个有限正数")
         if not np.isfinite(self.threshold) or self.threshold <= 0:
             raise ValueError("正常模型阈值必须是有限正数")
 
     @classmethod
-    def fit(cls, train_values, calibration_values, *, feature_config=None, normal=None, alpha=0.01):
+    def fit(cls, train_values, calibration_values, *, feature_config=None, normal=None, alpha=0.01,
+            score_mode="max"):
         if not np.isfinite(alpha) or not 0 < alpha < 0.5:
             raise ValueError("alpha 需在 (0, 0.5) 内")
+        if score_mode not in SCORE_MODES:
+            raise ValueError(f"打分方式只支持 {' / '.join(SCORE_MODES)}")
         train, calibration = _samples(train_values), _samples(calibration_values)
         scales = np.maximum(np.quantile(train, 0.99, axis=0), SCALE_FLOORS)
-        scores = (calibration / scales).max(axis=1)
+        score = _fit_score(train, scales, score_mode)
+        scores = frame_score(calibration, scales, score)
         # Only upper deviations are abnormal: quieter/steadier than training is normal.
         threshold = max(1.0, float(np.quantile(scores, 1 - alpha, method="higher")))
-        return cls(scales, threshold, feature_config, normal,
-                   {"method": "normal_only_upper_envelope", "alpha": alpha,
-                    "train_frames": len(train), "calibration_frames": len(calibration),
-                    "calibration_frame_exceedance": float(np.mean(scores > threshold)),
-                    "note": "alpha 是正常校准帧的经验尾部比例，不是事件误报率保证"})
+        detector = cls(scales, threshold, feature_config, normal,
+                       {"method": "normal_only_upper_envelope", "alpha": alpha,
+                        "train_frames": len(train), "calibration_frames": len(calibration),
+                        "calibration_frame_exceedance": float(np.mean(scores > threshold)),
+                        "score_mode": score_mode,
+                        "note": "alpha 是正常校准帧的经验尾部比例，不是事件误报率保证"}, score)
+        return detector
+
+    def with_threshold(self, threshold):
+        """Same model, different decision threshold (event-level calibration)."""
+        threshold = float(threshold)
+        if not np.isfinite(threshold) or threshold <= 0:
+            raise ValueError("阈值必须为有限正数")
+        return NormalModelDetector(self.scales, threshold, self.feature_config, self.normal,
+                                   self.training, self.score_config)
 
     def to_dict(self):
         return {"schema_version": 3, "detector": self.detector_type, "version": self.version,
                 "feature_config": self.feature_config.to_dict(), "normal": self.normal.to_dict(),
                 "feature_names": list(FEATURE_NAMES), "scales": self.scales.tolist(),
-                "threshold": self.threshold, "training": self.training}
+                "threshold": self.threshold, "training": self.training,
+                "score": self.score_config.to_dict()}
 
     @classmethod
     def from_dict(cls, obj):
         required = {"schema_version", "detector", "version", "feature_config", "normal",
                     "feature_names", "scales", "threshold", "training"}
-        if set(obj) != required or obj["schema_version"] != 3 or obj["detector"] != cls.detector_type:
+        if set(obj) - required - {"score"} or not required <= set(obj):
+            raise ValueError("无效正常模型字段或版本")
+        if obj["schema_version"] != 3 or obj["detector"] != cls.detector_type:
             raise ValueError("无效正常模型字段或版本")
         if obj["version"] != cls.version or obj["feature_names"] != list(FEATURE_NAMES):
             raise ValueError("正常模型特征/版本不匹配，请重新训练")
         return cls(obj["scales"], obj["threshold"], FeatureConfig.from_dict(obj["feature_config"]),
-                   NormalConfig.from_dict(obj["normal"]), obj["training"])
+                   NormalConfig.from_dict(obj["normal"]), obj["training"],
+                   ScoreConfig.from_dict(obj["score"]) if "score" in obj else None)
 
     def score(self, bundle):
         self.feature_config.assert_compatible(bundle.config)
-        return (normal_features(bundle, self.normal) / self.scales).max(axis=1)
+        return frame_score(normal_features(bundle, self.normal), self.scales, self.score_config)
 
     def predict_events(self, bundle, threshold=None, postprocess=None):
         """Compatibility API for anomaly consumers (including L2)."""
@@ -186,9 +316,15 @@ class NormalModelDetector:
         """Primary normal-region output, without any labels as input."""
         return self.analyze(bundle, threshold, postprocess)[1]["normal_regions"]
 
+    def predict_short_events(self, bundle, threshold=None, postprocess=None):
+        """Impulse hints only; they never modify the normal regions."""
+        return self.analyze(bundle, threshold, postprocess)[1]["short_events"]
+
     def analyze(self, bundle, threshold=None, postprocess=None):
         self.feature_config.assert_compatible(bundle.config)
-        allowed = {"enter_s", "release_s", "min_duration", "merge_gap", "padding", "low_ratio", "strong_ratio"}
+        allowed = {"enter_s", "release_s", "min_duration", "merge_gap", "padding", "low_ratio",
+                   "strong_ratio", "min_anomaly_s", "min_normal_s", "short_channel",
+                   "short_peak_ratio", "short_window_s"}
         if set(postprocess or {}) - allowed:
             raise ValueError("正常模型只允许覆盖事件过滤参数，特征窗口改变后须重新训练")
         cfg = replace(self.normal, **(postprocess or {}))
@@ -199,9 +335,11 @@ class NormalModelDetector:
             raise ValueError("音频太短，正常模型无法获得完整观察窗（至少约 1.4 秒）")
         values = normal_features(bundle, cfg)
         components = values / self.scales
-        score = components.max(axis=1)
+        score = frame_score(values, self.scales, self.score_config)
         events, traces = normal_windows(score, bundle.times, bundle.duration_s, threshold, cfg,
                                          bundle.config.target_step)
+        short = short_events(score, bundle.times, bundle.duration_s, threshold, cfg,
+                             bundle.config.target_step, covered=events)
         output = []
         for i, event in enumerate(events, 1):
             details = event_features(bundle, event, score, self.score_type)
@@ -212,9 +350,10 @@ class NormalModelDetector:
             active |= (bundle.times >= event["start_s"]) & (bundle.times < event["end_s"])
         normal_regions = normal_complement(output, bundle.duration_s)
         traces.update(active=active, stable=~active, normal_score=score, components=components,
-                      stable_segments=normal_regions, normal_regions=normal_regions,
-                      primary_output="normal_regions",
-                      output_mode="normal_model", anomaly_source="learned_normal_deviation",
+                      short_events=short, stable_segments=normal_regions,
+                      normal_regions=normal_regions, primary_output="normal_regions",
+                      output_mode="normal_model", score_mode=self.score_config.mode,
+                      anomaly_source="learned_normal_deviation",
                       curves=[{"key": "normal_deviation", "values": score, "threshold": threshold,
                                "label": "偏离正常的程度", "unit": "deviation_ratio",
                                "title": "相对正常样本的偏离（不是概率）",
@@ -228,6 +367,9 @@ def normal_windows(score, times, duration, threshold, cfg, step):
     Reject brief weak candidates BEFORE merging: repeated irrelevant clicks
     must not combine into a sufficiently long false alarm. Strong short events
     remain eligible; noise rejection is not simply dropping all short sounds.
+    After merging, fragment control removes pieces shorter than
+    ``min_anomaly_s`` (unless strong) and bridges normal gaps shorter than
+    ``min_normal_s``, so boundary jitter cannot split one disturbance in two.
     """
     raw = extract_events(score, times, threshold, threshold * cfg.low_ratio,
                          0, 0, duration, step)
@@ -249,8 +391,24 @@ def normal_windows(score, times, duration, threshold, cfg, step):
             merged[-1].update(end_s=event["end_s"], i1=event["i1"])
         else:
             merged.append(event)
-    output = []
+    # Fragment control: drop short leftovers, then bridge short normal gaps.
+    kept, dropped = [], []
     for event in merged:
+        short = event["end_s"] - event["start_s"] < cfg.min_anomaly_s - 1e-9
+        peak = float(score[event["i0"]:event["i1"] + 1].max())
+        if short and peak < threshold * cfg.strong_ratio:
+            dropped.append({"start_s": event["start_s"], "end_s": event["end_s"],
+                            "reason": "shorter_than_min_anomaly", "peak_score": peak})
+            continue
+        kept.append(event)
+    bridged = []
+    for event in kept:
+        if bridged and event["start_s"] - bridged[-1]["end_s"] < cfg.min_normal_s - 1e-9:
+            bridged[-1].update(end_s=event["end_s"], i1=event["i1"])
+        else:
+            bridged.append(event)
+    output = []
+    for event in bridged:
         event["start_s"] = max(0, event["start_s"] - cfg.padding)
         event["end_s"] = min(duration, event["end_s"] + cfg.padding)
         if output and event["start_s"] <= output[-1]["end_s"]:
@@ -266,7 +424,37 @@ def normal_windows(score, times, duration, threshold, cfg, step):
                      boundary_reason="end_of_file" if censored else "return_to_learned_normal",
                      right_censored=censored,
                      at_edge=event["start_s"] == 0 or event["end_s"] >= duration)
-    return output, {"rejected_triggers": rejected}
+    return output, {"rejected_triggers": rejected + dropped}
+
+
+def short_events(score, times, duration, threshold, cfg, step, covered=()):
+    """Impulse channel: short, high-contrast peaks for review only.
+
+    The main detector needs a sustained or very strong excursion; genuine
+    sub-second impacts often fall just below that.  This channel reports them
+    as presence hints, deliberately excluded from ``events``, the normal
+    regions and every duration metric.
+    """
+    if not cfg.short_channel:
+        return []
+    level = threshold * cfg.short_peak_ratio
+    above = np.flatnonzero(score >= level)
+    if not len(above):
+        return []
+    width = max(1, round(cfg.short_window_s / step))
+    groups = np.split(above, np.flatnonzero(np.diff(above) > width) + 1)
+    spans = [(e["start_s"], e["end_s"]) for e in covered]
+    out = []
+    for group in groups:
+        peak = int(group[np.argmax(score[group])])
+        a = max(0.0, float(times[peak]) - cfg.short_window_s / 2)
+        b = min(duration, float(times[peak]) + cfg.short_window_s / 2)
+        if any(a < end and b > start for start, end in spans):
+            continue
+        out.append({"start_s": a, "end_s": b, "duration_s": b - a,
+                    "peak_score": float(score[peak]), "peak_time_s": float(times[peak]),
+                    "channel": "short_impulse", "threshold": level})
+    return out
 
 
 def normal_complement(events, duration):
@@ -279,3 +467,54 @@ def normal_complement(events, duration):
         spans.append((cursor, duration))
     return [{"start_s": a, "end_s": b, "duration_s": b - a, "coverage": (b - a) / duration}
             for a, b in spans]
+
+
+def event_level_threshold(detector, calibration, target_fp, *, normal_cfg=None, floor=None):
+    """Pick the smallest threshold whose calibration normal-time alarm <= target.
+
+    ``calibration`` is a list of dicts with ``times``, ``values``, ``duration``
+    and ``normal`` (explicit normal spans).  Frame quantiles do not transfer to
+    decision-level false alarms (hysteresis, backdating and merging multiply
+    them), so the operating point is searched on the metric that matters.
+    """
+    if not 0 < target_fp < 1:
+        raise ValueError("目标误报率需在 (0,1) 内")
+    cfg = normal_cfg or detector.normal
+    step = detector.feature_config.target_step
+    items = []
+    for entry in calibration:
+        score = frame_score(entry["values"], detector.scales, detector.score_config)
+        items.append((entry["times"], score, float(entry["duration"]), entry["normal"]))
+    pooled = np.concatenate([s for _, s, _, _ in items])
+    candidates = np.unique(np.maximum(1.0, np.quantile(pooled, np.linspace(0.50, 0.9995, 80),
+                                                      method="higher")))
+    # ``floor`` keeps the frame-quantile rule as a sensitivity cap: the event
+    # budget may tighten the threshold but never loosen it below the alpha rule.
+    if floor is not None:
+        candidates = candidates[candidates >= float(floor) - 1e-12]
+
+    def alarm_fraction(threshold):
+        normal_s = alarmed_s = 0.0
+        for times, score, duration, spans in items:
+            events, _ = normal_windows(score, times, duration, threshold, cfg, step)
+            regions = normal_complement(events, duration)
+            for a, b in spans:
+                normal_s += b - a
+                alarmed_s += (b - a) - sum(max(0.0, min(b, r["end_s"]) - max(a, r["start_s"]))
+                                           for r in regions)
+        return alarmed_s / normal_s if normal_s > 0 else 0.0
+
+    if not len(candidates):
+        return float(floor), {"target_fp": target_fp, "achieved_calibration_fp": None,
+                              "note": "没有高于灵敏度上限的候选阈值"}
+    measured = [(float(t), alarm_fraction(float(t))) for t in candidates]
+    # Smallest threshold that still meets the budget, and that no larger
+    # candidate breaks (guards against a noisy non-monotone measurement).
+    chosen, achieved = float(candidates[-1]), measured[-1][1]
+    for i, (threshold, fraction) in enumerate(measured):
+        if all(f <= target_fp + 1e-12 for _, f in measured[i:]):
+            chosen, achieved = threshold, fraction
+            break
+    return chosen, {"target_fp": target_fp, "achieved_calibration_fp": achieved,
+                    "feasible": achieved is not None and achieved <= target_fp + 1e-12,
+                    "candidates": [[t, f] for t, f in measured]}

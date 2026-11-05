@@ -8,9 +8,10 @@
 自动生成 `val/comparison.pdf`、`test/comparison.pdf` 及配套 CSV/JSON/简报（本次只实现代码，未运行训练）。
 详见 [L1 PANNs 结构、约束与占位路径命令](docs/L1_PANNS.md)。新 L1 需要已有 PyTorch 和本地 CNN14 权重，不自动安装或下载。
 
-当前工程版本 **0.11.0**。**normal_envelope_v1 正常样本学习模型**支持多批次目录一次训练
-（`--dataset-dir`）和跨批次混合打散划分（`--split shuffle`）；原有
-`spectral_stability_v3`、`spectral_event_v2` 配置保留，可复现历史结果。
+当前工程版本 **0.12.0**。**normal_envelope_v1 正常样本学习模型**支持多批次目录一次训练
+（`--dataset-dir`）、跨批次混合打散划分（`--split shuffle`）、整批留出（`--holdout-batch`）、
+按事件级误报预算定阈值（`--target-fp`）、可选的联合打分（`--score-mode joint`，默认关闭）；
+原有 `spectral_stability_v3`、`spectral_event_v2` 配置保留，可复现历史结果。
 不传 `--config` 仍使用旧有 v3 默认规则；使用新路线必须传训练得到的 `model.json`。
 当前模型在 `runs/normal_mixed_v1/model.json`（B05+B06+B07 共 196 条）。
 
@@ -101,6 +102,26 @@ python -m wind_audio l1-detect \
 图片和 PDF 默认开启；`--no-plots` 只出数值。合并评估目前只接受批次目录与正常/平稳口径，
 `--target anomaly` 仍走单批 `--audio-dir` 通路。
 
+训练默认值（0.12.0 起，命令不变）：
+
+| 项 | 默认 | 作用 |
+|---|---|---|
+| `--score-mode` | `max` | `max`=单维取最大（已验证）；`joint`=白化联合偏离，实验性，见下 |
+| `--target-fp` | `0.02` | 校准集上允许的正常时长误报比例，阈值按**事件级**搜索；`0` 退回帧分位口径 |
+| `--min-anomaly-s` | `0.30` | 短于此且不显著的异常碎片并入正常 |
+| `--min-normal-s` | `0.50` | 夹在两次异常之间的短正常间隙并入异常 |
+| `--holdout-batch` | 空 | 整批留作检查集，其余批次训练（跨设备口径） |
+| `--boundary-tolerance` | `0.2` | 报告额外给出标注边界 ±N 秒不计分的容差口径 |
+| `--no-short-channel` | 关 | 关闭脉冲通道（只影响提示，不影响事件与正常区域） |
+
+`joint` 打分默认关闭：它放大了"少见的维度组合"，但模拟显示设备整体更活跃与宽带异常都沿主相关轴移动，
+会被一起降权——跨设备误报只从 3.64% 降到 3.41%，宽带异常漏检却从 12.2% 升到 15.5%。
+要对比时显式加 `--score-mode joint`，两份模型用同一份数据各测一次。
+
+每次训练报告都会附 `cross_batch`：**留一批次交叉验证**（每个批次单独留出、重新拟合尺度与阈值后在
+该批次上评分）。打散留出把同设备录音混进训练，只有 `cross_batch` 是跨设备的诚实数字。
+需要直接训练一个不含某台设备的模型时用 `--holdout-batch B07`。
+
 本次已训练的模型为 `runs/normal_mixed_v1/model.json`，训练记录、逐文件批次归属和逐集合指标
 在同目录 `training_report.json`；`manifest.csv/annotations.csv/pairing.csv` 是合并后的输入快照。
 训练输出目录必须是新的；`--seed` 固定打散结果，可复现同一划分。
@@ -125,6 +146,9 @@ B07 误报 14.1%、覆盖 68.1%。打散让同一设备的录音同时进入训�
 异常错当正常 709.3 s、正常被排除 227.7 s。`brief.md` 与 `metrics.json` 里有完整口径，
 `comparison.pdf` 是 196 页逐条对照，用来人工复核漏检和误报的位置。
 详见 [正常样本学习说明](docs/NORMAL_MODEL.md)。
+
+> 下一步方案（未实现）：频谱形状趋势 + 概率密度模型，含增益不变性、跨设备误报率迁移的
+> 定理与证明，以及设备可辨识度实验的通过判据 —— [论证与实现](docs/SHAPE_GMM.md)。
 
 ### 检测版：仅指定原始音频
 

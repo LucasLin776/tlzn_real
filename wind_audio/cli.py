@@ -110,7 +110,8 @@ def _detector_from_args(args):
             if getattr(args, arg, None) is not None:
                 settings[key] = getattr(args, arg)
         return NormalModelDetector(base.scales, base.threshold if args.threshold is None else args.threshold,
-                                   base.feature_config, NormalConfig(**settings), base.training)
+                                   base.feature_config, NormalConfig(**settings), base.training,
+                                   base.score_config)
     if isinstance(base, SpectralChangeDetector):
         clash = sorted(set(provided) & V3_ONLY_ARGS)
         if clash:
@@ -344,7 +345,7 @@ def cmd_evaluate(args) -> int:
         result = evaluate_detector(
             detector, records, anns, audio_ids, manifest, detector.feature_config,
             iou_threshold=args.match_iou, on_file=report.add if report else None,
-            target_label=target,
+            target_label=target, boundary_tolerance=args.boundary_tolerance,
         )
         if result.get("file_accuracy") is None and result["time_accuracy"] is None:
             raise ValueError("没有可评估标签；请提供文件标签、精确区间，或确认完整审核后设置 --assume-unlabeled-normal")
@@ -374,6 +375,11 @@ def cmd_evaluate(args) -> int:
         print(f"正常时长精确率={_percent(tm['precision'])}；正常时长召回率={_percent(tm['recall'])}；"
               f"时长准确率={_percent(tm['accuracy'])}")
         print(f"异常错当正常={tm['fp']:.3f}s；正常被排除={tm['fn']:.3f}s")
+        tolerant = result.get("boundary_tolerant")
+        if tolerant:
+            ttm = tolerant["time_metrics"]
+            print(f"±{tolerant['tolerance_s']:.1f}s 边界容差口径：正常时长精确率={_percent(ttm['precision'])}；"
+                  f"召回率={_percent(ttm['recall'])}；时长准确率={_percent(ttm['accuracy'])}")
         print(f"输出: {metrics}, {brief}, {out / 'normal_regions.csv'}")
         if report is not None:
             print(f"正常区域对照 PDF: {out / 'comparison.pdf'}（{result['visual_report']['pages']} 页）")
@@ -588,6 +594,7 @@ def _run_one(
                   "postprocess_source": postprocess_source,
                   "requires_training": bool(getattr(detector, "requires_training", False))},
         "events": events,
+        "short_events": traces.get("short_events") or [],
         "stable_segments": segments,
         "label": label,
         "diagnostics": diagnostics,
@@ -595,6 +602,8 @@ def _run_one(
     }
     _write_json(out_dir / "events.json", payload)
     _events_csv(events, out_dir / "events.csv")
+    if payload["short_events"]:
+        _events_csv(payload["short_events"], out_dir / "short_events.csv")
     _write_json(out_dir / "label.json", {k: label[k] for k in ("intervals", "count", "rule", "max_intervals")})
     if segments:
         with (out_dir / "stable_segments.csv").open("w", encoding="utf-8-sig", newline="") as fh:
@@ -753,15 +762,20 @@ def cmd_review_import(args) -> int:
 def cmd_train_normal(args) -> int:
     from .normal_fit import fit_normal
     cfg = NormalConfig(enter_s=args.enter_s, release_s=args.normal_release_s,
-                       min_duration=args.min_dur, merge_gap=args.merge_gap)
+                       min_duration=args.min_dur, merge_gap=args.merge_gap,
+                       min_anomaly_s=args.min_anomaly_s, min_normal_s=args.min_normal_s,
+                       short_channel=not args.no_short_channel)
     # Batch folders are pooled, so the sensible defaults differ from the
     # single-directory entry: shuffle instead of "the newest files are the test".
     split_mode = args.split or ("shuffle" if args.dataset_dir else "temporal")
+    holdout = [name.strip() for name in args.holdout_batch.split(",") if name.strip()]
     detector, report = fit_normal(
         args.audio_dir, args.labels, args.out, dataset_dir=args.dataset_dir, pairing=args.pairing,
         fully_reviewed=args.fully_reviewed_normal, normal=cfg, alpha=args.alpha,
         calibration_fraction=args.calibration_fraction, test_fraction=args.test_fraction,
-        split_mode=split_mode, seed=args.seed)
+        split_mode=split_mode, seed=args.seed, holdout_batches=holdout,
+        target_fp=None if args.target_fp <= 0 else args.target_fp,
+        score_mode=args.score_mode, boundary_tolerance=args.boundary_tolerance)
     out = Path(args.out)
     _write_json(out / "model.json", detector.to_dict())
     _write_json(out / "training_report.json", report)
@@ -769,12 +783,36 @@ def cmd_train_normal(args) -> int:
     for warning in report["warnings"]:
         print(f"  · {warning}")
     print(f"划分: {report['split_policy']}")
+    print(f"打分方式: {detector.score_config.mode}；阈值 {detector.threshold:.4f}（"
+          f"{detector.training.get('threshold_policy')}）")
+    calibration = report.get("threshold_calibration") or {}
+    if calibration.get("achieved_calibration_fp") is not None:
+        print(f"校准集正常时长误报: {calibration['achieved_calibration_fp']:.2%} "
+              f"(目标 ≤ {calibration['target_fp']:.2%})")
     print("只使用训练/校准集的正常区间；留出检查未用于拟合或选择阈值。")
     for group, metrics in report["metrics"].items():
         tm = metrics["time_metrics"]
         print(f"  {group}: {metrics['files']} 条，时长准确率={_rate(metrics['time_accuracy'])} "
               f"异常时长召回={_rate(tm['recall'])} 精确率={_rate(tm['precision'])} "
               f"事件召回={_rate(metrics['event_recall'])} 正常误报={tm['fp']:.2f}s")
+        tolerant = metrics.get("boundary_tolerant") or {}
+        print(f"    正常时长匹配={_rate(metrics.get('normal_match'))} "
+              f"模型正常精确率={_rate(metrics.get('model_normal_precision'))} "
+              f"脉冲通道 <1s 命中={_rate((metrics.get('short_channel') or {}).get('recall_under_1s'))}")
+        if tolerant:
+            print(f"    ±{tolerant['tolerance_s']:.1f}s 容差口径：时长准确率={_rate(tolerant['time_accuracy'])} "
+                  f"异常召回={_rate(tolerant['time_metrics']['recall'])} "
+                  f"精确率={_rate(tolerant['time_metrics']['precision'])}")
+    cross = report.get("cross_batch") or {}
+    if cross:
+        print("跨批次（留一整批重新拟合，跨设备口径）：")
+        for batch, value in cross.items():
+            if value.get("skipped"):
+                print(f"  {batch}: 跳过（{value['skipped']}）")
+                continue
+            print(f"  {batch}: {value['held_files']} 条，正常时长匹配={_rate(value['normal_match'])} "
+                  f"模型正常精确率={_rate(value['model_normal_precision'])} "
+                  f"异常时长召回={_rate(value['anomaly_recall'])} 阈值={value['threshold']:.3f}")
     return 0
 
 
@@ -902,6 +940,20 @@ def build_parser() -> argparse.ArgumentParser:
     normal.add_argument("--split", choices=["temporal", "shuffle"],
                         help="数据划分：temporal 按时间顺序切（单批默认）；shuffle 全局混合打散（批次目录默认）")
     normal.add_argument("--seed", type=int, default=0, help="shuffle 划分的随机种子，默认 0，可复现")
+    normal.add_argument("--holdout-batch", default="",
+                        help="整批留作检查集，如 B07 或 B06,B07；其余批次用于训练/校准（跨设备口径）")
+    normal.add_argument("--target-fp", type=float, default=0.02,
+                        help="校准集上允许的正常时长误报比例，默认 0.02；0 表示退回帧分位口径")
+    normal.add_argument("--score-mode", choices=["joint", "max"], default="max",
+                        help="打分方式：max=单维最大值（默认，已验证）；joint=白化联合偏离（实验性）")
+    normal.add_argument("--min-anomaly-s", type=float, default=0.30,
+                        help="短于此且不显著的异常片段并入正常，默认 0.30 秒")
+    normal.add_argument("--min-normal-s", type=float, default=0.50,
+                        help="异常之间短于此的正常间隙并入异常，默认 0.50 秒")
+    normal.add_argument("--no-short-channel", action="store_true",
+                        help="关闭脉冲通道（只影响提示，不影响 events 与正常区域）")
+    normal.add_argument("--boundary-tolerance", type=float, default=0.2,
+                        help="报告里额外给出标注边界 ±N 秒不计分的容差口径，默认 0.2；0 表示关闭")
     normal.add_argument("--fully-reviewed-normal", action="store_true", help="确认所有正常区间均已标出，其余为异常")
     normal.add_argument("--alpha", type=float, default=0.01, help="正常校准帧的经验尾部比例，不是事件误报率保证")
     normal.add_argument("--calibration-fraction", type=float, default=0.2)
@@ -977,6 +1029,8 @@ def build_parser() -> argparse.ArgumentParser:
     ev.add_argument("--split", choices=["val", "test"], default="test")
     ev.add_argument("--out", default="reports/l1_test")
     ev.add_argument("--match-iou", type=float, default=0.1)
+    ev.add_argument("--boundary-tolerance", type=float, default=0.2,
+                    help="标注边界 ±N 秒不计分的容差口径（另出一份指标），0 表示关闭")
     ev.add_argument("--plot-merge-gap", type=float, default=.3,
                     help="辅助事件簇对比图的合并间隔，默认 0.3 秒；不改变标签和正式指标")
     ev.add_argument("--plot-font", help="可选中文 TTF/TTC 字体路径；默认自动寻找系统中文字体")

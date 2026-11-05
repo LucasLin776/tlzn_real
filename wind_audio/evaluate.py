@@ -95,12 +95,25 @@ def match_events(pred: list[dict], gt: list[dict], iou_threshold: float = 0.1) -
     }
 
 
-def _reviewed_regions(record, anns):
-    """Continuous annotation boundaries: do not quantise short events to 100 ms."""
+def _reviewed_regions(record, anns, boundary_tolerance=0.0):
+    """Continuous annotation boundaries: do not quantise short events to 100 ms.
+
+    ``boundary_tolerance`` (seconds) marks a band of +-tol around every internal
+    annotation boundary as *unknown*.  Annotations are only accurate to a few
+    hundred milliseconds, so without this the duration metrics charge every
+    off-by-a-bit boundary as a miss; the strict numbers are still reported.
+    File edges are deliberately not masked.
+    """
     mine = [a for a in anns if a.audio_id == record.audio_id]
     intervals = [a for a in mine if a.precision == "interval"]
-    points = sorted({0.0, record.duration_s} |
-                    {max(0.0, min(record.duration_s, t)) for a in intervals for t in (a.start_s, a.end_s)})
+    tol = max(0.0, float(boundary_tolerance))
+    edges = sorted({max(0.0, min(record.duration_s, b)) for a in intervals
+                    for b in (a.start_s, a.end_s) if 0.0 < b < record.duration_s}) if tol else []
+    points = {0.0, record.duration_s}
+    points |= {max(0.0, min(record.duration_s, t)) for a in intervals for t in (a.start_s, a.end_s)}
+    for edge in edges:
+        points |= {max(0.0, edge - tol), min(record.duration_s, edge + tol)}
+    points = sorted(points)
     infer_normal = record.fully_reviewed and not any(
         a.precision == "file" and a.label in {"anomaly", "uncertain"} for a in mine)
     regions = []
@@ -109,6 +122,8 @@ def _reviewed_regions(record, anns):
         labels = {a.label for a in intervals if a.start_s <= mid < a.end_s}
         label = (next(iter(labels)) if len(labels) == 1 else
                  "normal" if not labels and infer_normal else "uncertain")
+        if edges and any(abs(mid - edge) <= tol for edge in edges):
+            label = "uncertain"
         regions.append({"start_s": start, "end_s": end, "label": label})
     return regions
 
@@ -144,11 +159,11 @@ def _file_label(record, anns, regions):
     return None
 
 
-def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1):
+def evaluate_file_events(record, anns, pred_events, iou_threshold=0.1, boundary_tolerance=0.0):
     if not 0 < iou_threshold <= 1:
         raise ValueError("IoU 门槛需要在 (0,1] 内")
     gt = anomaly_events(record, anns)
-    regions = _reviewed_regions(record, anns)
+    regions = _reviewed_regions(record, anns, boundary_tolerance)
     normal_s = sum(r["end_s"] - r["start_s"] for r in regions if r["label"] == "normal")
     anomaly_s = sum(r["end_s"] - r["start_s"] for r in regions if r["label"] == "anomaly")
     reviewed_s = normal_s + anomaly_s
@@ -356,6 +371,7 @@ def evaluate_detector(
     iou_threshold: float = 0.1,
     on_file=None,
     target_label="anomaly",
+    boundary_tolerance: float = 0.0,
 ) -> dict:
     if target_label not in {"normal", "anomaly"}:
         raise ValueError("测试目标必须为 normal / anomaly")
@@ -369,7 +385,8 @@ def evaluate_detector(
     missing = set(audio_ids) - set(by_id)
     if missing:
         raise ValueError(f"评估集合引用不存在的 audio_id: {sorted(missing)}")
-    rows, anomaly_rows = [], []
+    tolerance = max(0.0, float(boundary_tolerance))
+    rows, anomaly_rows, tolerant_rows = [], [], []
     for index, audio_id in enumerate(audio_ids, 1):
         rec = by_id[audio_id]
         x, sr = load_wav(resolve_audio_path(rec, manifest_path), target_sr=cfg.sr)
@@ -382,8 +399,13 @@ def evaluate_detector(
             from .normal_eval import evaluate_normal_regions
             row = evaluate_normal_regions(rec, anns, traces["normal_regions"], iou_threshold)
             anomaly_rows.append(evaluate_file_events(rec, anns, pred, iou_threshold))
+            if tolerance:
+                tolerant_rows.append(evaluate_normal_regions(
+                    rec, anns, traces["normal_regions"], iou_threshold, tolerance))
         else:
             row = evaluate_file_events(rec, anns, pred, iou_threshold)
+            if tolerance:
+                tolerant_rows.append(evaluate_file_events(rec, anns, pred, iou_threshold, tolerance))
         row["audio_path"] = str(resolve_audio_path(rec, manifest_path))
         if on_file is not None:
             on_file(rec, anns, x, sr, bundle, traces, row, detector, index, len(audio_ids))
@@ -396,8 +418,21 @@ def evaluate_detector(
         from .normal_eval import aggregate_normal_metrics
         overall = aggregate_normal_metrics(rows)
         overall["anomaly_diagnostics"] = aggregate_file_metrics(anomaly_rows)
+        tolerant = aggregate_normal_metrics(tolerant_rows) if tolerant_rows else None
     else:
         overall = aggregate_file_metrics(rows)
+        tolerant = aggregate_file_metrics(tolerant_rows) if tolerant_rows else None
+    if tolerant is not None:
+        # Same predictions, only the annotation band around each boundary is
+        # unscored.  The gap to the strict numbers is boundary precision.
+        overall["boundary_tolerant"] = {
+            "tolerance_s": tolerance,
+            "time_accuracy": tolerant["time_accuracy"],
+            "time_metrics": tolerant["time_metrics"],
+            "event_recall": tolerant.get("event_recall"),
+            "event_precision": tolerant.get("event_precision"),
+            "files": tolerant["files"],
+        }
     if detector.detector_type == "normal_envelope":
         overall["threshold"] = float(detector.threshold if threshold is None else threshold)
         overall["normal_config"] = detector.normal.to_dict()

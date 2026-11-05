@@ -9,10 +9,11 @@ from .labeling import collapse_anomalies, label_text
 from .evaluate import _overlap, _percent, _reviewed_regions, binary_metrics, merge_intervals
 
 
-def evaluate_normal_regions(record, annotations, predictions, iou_threshold=0.1):
+def evaluate_normal_regions(record, annotations, predictions, iou_threshold=0.1,
+                            boundary_tolerance=0.0):
     if not 0 < iou_threshold <= 1:
         raise ValueError("IoU 门槛需要在 (0,1] 内")
-    regions = _reviewed_regions(record, annotations)
+    regions = _reviewed_regions(record, annotations, boundary_tolerance)
     # Use actual reviewed normal ranges, not inversion of the anomaly-event list.
     gt = [{"start_s": a, "end_s": b} for a, b in merge_intervals(
         [r for r in regions if r["label"] == "normal"])]
@@ -124,6 +125,12 @@ def write_normal_outputs(result, out_dir):
              f"- 异常错当正常（FP）：{tm['fp']:.3f} 秒；正常被排除（FN）：{tm['fn']:.3f} 秒", "",
              "注意：正常召回率高并不意味着异常检出率高，必须同时看异常错当正常的时长。",
              "逐段范围见 normal_regions.csv；逐文件指标见 per_file.csv；完整结果见 metrics.json。"]
+    tolerant = result.get("boundary_tolerant")
+    if tolerant:
+        tm = tolerant["time_metrics"]
+        lines += ["", f"- 标注边界 ±{tolerant['tolerance_s']:.1f} 秒不计分的容差口径："
+                      f"时长准确率 {_percent(tm['accuracy'])}，"
+                      f"正常时长精确率 {_percent(tm['precision'])}、召回率 {_percent(tm['recall'])}"]
     if result.get("visual_report"):
         lines += [f"PDF：comparison.pdf，共 {result['visual_report']['pages']} 页，上行为人工正常，下行为模型正常。"]
     if result.get("data_reuse_warning"):
